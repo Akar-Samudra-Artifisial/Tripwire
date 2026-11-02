@@ -112,15 +112,17 @@ describe('openRevisit', () => {
     expect(repo.revisits.size).toBe(1);
   });
 
-  it('a decision with an open revisit from another tripwire returns already_open without creating', async () => {
+  it('a decision with an open revisit from another tripwire returns already_open and stays tripped', async () => {
     const first = seedTripwire(repo, { status: 'tripped', strikes: 2 });
     await openRevisit(first.tripwireId, deps);
     const second = seedTripwire(repo, { status: 'tripped', strikes: 2, decisionId: first.decisionId });
+    const relations = repo.relations.length;
     const result = await openRevisit(second.tripwireId, deps);
     expect(result).toEqual({ created: false, reason: 'already_open', issueKey: 'SUP-1' });
     expect(createIssue).toHaveBeenCalledTimes(1);
-    expect(repo.tripwires.get(second.tripwireId)?.status).toBe('revisiting');
-    expect(repo.relations.at(-1)).toMatchObject({ type: 'invalidated-by', fromId: second.assumptionId, toId: 'SUP-1' });
+    // Not `revisiting` on someone else's issue: the next evaluation retries once SUP-1 is closed.
+    expect(repo.tripwires.get(second.tripwireId)?.status).toBe('tripped');
+    expect(repo.relations).toHaveLength(relations);
   });
 
   it('no Revisit project → no_project and the tripwire goes back to tripped', async () => {

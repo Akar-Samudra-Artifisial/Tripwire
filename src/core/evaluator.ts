@@ -84,10 +84,14 @@ export async function evaluateOne(tripwireId: string, deps: EvalDeps, settings?:
 
   // A `revisiting` tripwire whose Revisit row never got written (crash, failed rollback) would wait forever:
   // treat it as `tripped` so this reading can retry `openRevisit`.
+  // Same for one left on another tripwire's open Revisit (older rows, before `openRevisit` kept those `tripped`).
   let from = tripwire.status;
-  if (from === 'revisiting' && !(await repo.findOpenRevisit(ctx.decision.id))) {
-    console.warn('tripwire evaluate: revisiting without an open revisit, retrying as tripped', { tripwireId });
-    from = 'tripped';
+  if (from === 'revisiting') {
+    const open = await repo.findOpenRevisit(ctx.decision.id);
+    if (!open || (open.tripwireId !== undefined && open.tripwireId !== tripwireId)) {
+      console.warn('tripwire evaluate: revisiting without an open revisit of its own, retrying as tripped', { tripwireId, otherRevisit: Boolean(open) });
+      from = 'tripped';
+    }
   }
 
   const now = deps.now();

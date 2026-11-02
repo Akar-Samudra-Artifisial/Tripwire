@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { describeSpec, formatReading } from '../../src/core/describe';
+import { describeSpec, describeValue, formatReading } from '../../src/core/describe';
 import type { TripwireKind } from '../../src/core/types';
 import { call } from './bridge';
 import { ErrorText, Shell, StatusBadge } from './components';
@@ -71,7 +71,7 @@ function Reading({ tripwire }: { tripwire: Tripwire }) {
 }
 
 /** Last evaluations, newest first. */
-function Trend({ evaluations }: { evaluations: Evaluation[] }) {
+function Trend({ tripwire, evaluations }: { tripwire: Tripwire; evaluations: Evaluation[] }) {
   if (evaluations.length === 0) return null;
   return (
     <details className="trend">
@@ -79,7 +79,7 @@ function Trend({ evaluations }: { evaluations: Evaluation[] }) {
       <ul className="trend__list">
         {evaluations.map((e) => (
           <li key={e.id}>
-            {e.evaluatedAt.slice(0, 10)} · {e.value ?? '—'} · {e.outcome}
+            {e.evaluatedAt.slice(0, 10)} · {describeValue(tripwire.kind, tripwire.spec, e.value)} · {e.outcome}
           </li>
         ))}
       </ul>
@@ -124,7 +124,7 @@ function AssumptionItem({ row, canEdit, onChanged }: { row: Row; canEdit: boolea
       </p>
       <Reading tripwire={tripwire} />
       {row.revisit && <p className="muted">Revisit task: {row.revisit.issueKey}</p>}
-      <Trend evaluations={row.evaluations} />
+      <Trend tripwire={row.tripwire} evaluations={row.evaluations} />
       {canEdit && tripwire.status === 'proposed' && (
         <div className="assumption__actions">
           <button type="button" onClick={() => confirm('accept')} disabled={state.busy}>

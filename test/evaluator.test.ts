@@ -169,6 +169,17 @@ describe('evaluateOne', () => {
     expect(openRevisit).toHaveBeenCalledWith(tripwireId);
   });
 
+  it('a revisiting tripwire left on another tripwire’s open Revisit goes back through tripped and retries', async () => {
+    const first = seedTripwire(repo, { status: 'revisiting', strikes: 2 });
+    await repo.insertRevisit({ id: 'rv-1', decisionId: first.decisionId, issueKey: 'SUP-1', tripwireId: first.tripwireId, status: 'open' });
+    const second = seedTripwire(repo, { status: 'revisiting', strikes: 2, decisionId: first.decisionId });
+    count = 37;
+    expect(await evaluateOne(second.tripwireId, deps)).toMatchObject({ newStatus: 'tripped', revisitRequested: true });
+    expect(await evaluateOne(first.tripwireId, deps)).toMatchObject({ newStatus: 'revisiting', revisitRequested: false });
+    expect(openRevisit).toHaveBeenCalledTimes(1);
+    expect(openRevisit).toHaveBeenCalledWith(second.tripwireId);
+  });
+
   it('skips proposed, unknown and graph_relation tripwires', async () => {
     const proposed = seedTripwire(repo, { status: 'proposed' }).tripwireId;
     const graph = seedTripwire(repo).tripwireId;

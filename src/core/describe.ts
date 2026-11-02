@@ -53,6 +53,20 @@ function readingText(t: ReadingInput, s: Record<string, unknown>, v: number): st
 }
 
 /**
+ * One recorded value in words, for trend lists: `37` for numeric kinds, `1 day past 2026-11-01` (date),
+ * `check-in overdue by 3 days` (checkin) or `page version 6` (content_change); `—` when nothing was measured.
+ * Past readings are described against the spec, without the current baseline (it may have moved since).
+ */
+export function describeValue(kind: TripwireKind, spec: unknown, value: number | null): string {
+  if (value === null) return '—';
+  if (kind === 'jql_threshold' || kind === 'graph_relation') return String(value);
+  const s = (typeof spec === 'object' && spec !== null ? spec : {}) as Record<string, unknown>;
+  // A handled date's history still shows the days, not "handled".
+  const unresolved = kind === 'date' ? { ...s, resolved: false } : s;
+  return readingText({ kind, spec: unresolved, lastValue: value, lastEvaluatedAt: null, baselineVersion: null }, unresolved, value);
+}
+
+/**
  * Latest reading, e.g. `37 (measured 2026-11-02) · threshold > 10`, `3 days left until 2027-03-31 (measured …)`
  * or `check-in overdue by 1 day (measured …)`; "not measured yet" before the first evaluation.
  */
