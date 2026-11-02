@@ -2,9 +2,23 @@
 
 Tripwire watches the assumptions behind your team's decisions and reopens a decision the moment the data says it's no longer true.
 
-Built on Atlassian Forge for Confluence (required) and Jira (optional). Tripwire reads decision pages in Confluence, turns their assumptions into checks (Jira query thresholds, Teamwork Graph relations, dates, page changes or scheduled check-ins), and gives the owner a revisit task when a check trips.
+Built on Atlassian Forge for Confluence (required) and Jira (optional). Tripwire reads decision pages in Confluence, turns their assumptions into checks (Jira query thresholds, dates, page changes or scheduled check-ins), and gives the owner a Revisit task in Jira when a check trips.
 
-> Status: early scaffold. Views and the Rovo action return placeholder data.
+## Features
+
+- **Assumption extraction** – Forge LLM reads a Confluence decision page (forced tool call) and proposes tripwires. Every quote is verified against the page text; JQL is checked by a guard and limited to allowlisted projects. Nothing is watched until the owner clicks **Accept** in the page byline.
+- **Trigger kinds**
+  - `jql_threshold` – a Jira query count crosses a threshold. Needs two consecutive tripped readings (anti-noise); shows **near** at 80% of the threshold.
+  - `date`, `checkin`, `content_change` – trip on the first reading.
+- **Revisit tasks** – one Jira work item per decision, with the evidence in the *Decision revisit* issue panel. **Reaffirm** an assumption to re-arm its tripwire. (Supersede is not built yet.)
+- **Contradiction Radar** – the **Decision Health** global page in Confluence (tabs *Overview* and *Radar*) flags decisions that may contradict each other and rates cross-team severity.
+- **Rovo agent "Decision Steward"** – answers "which decisions rest on outdated assumptions?" through the `list-tripped` action (only pages the user can view).
+- **Admin setup in Jira** – Initialise, settings, and demo buttons (**Load demo data**, **Simulate a busy month**, **Reset demo**) that run as queued jobs with progress on the page.
+- **Storage** – decisions, tripwires, evaluations and relations live in Forge SQL.
+
+### Teamwork Graph (read-only)
+
+Tripwire only **reads** Teamwork Graph (Preview), for the Radar: `confluencePageContributors` and `atlassianUserInTeams` via `api.asUser().requestTeamworkGraph`. Only aggregate counts are stored; Tripwire writes nothing to the graph. New pages can take a while to be indexed, so Radar team data for freshly created pages may appear later.
 
 ## Install (judges)
 
@@ -19,7 +33,11 @@ Installing requires an organization admin, because Tripwire reads Teamwork Graph
 4. Click **Load demo data** and wait until the page shows the result (one click; progress is shown while it runs).
 5. In Confluence, open the page **Defer CSV export** in the **Decisions (DEC)** space and click **Accept** on its tripwire.
 6. Back in Tripwire setup, click **Simulate a busy month** and wait for the result, e.g. "Revisit: SUP-12".
-7. Open that Revisit issue in Jira to see why the decision should be reopened.
+7. Open that Revisit issue in the **SUP** project to see why the decision should be reopened, then click **Reaffirm** on an assumption to re-arm it.
+8. In Confluence, open **Decision Health** (Apps menu) and switch to the **Radar** tab to see contradicting decisions.
+9. Ask Rovo agent **Decision Steward**: "Which of our decisions rest on outdated assumptions?"
+
+To start over, use **Reset demo** in Tripwire setup.
 
 ## Development
 
