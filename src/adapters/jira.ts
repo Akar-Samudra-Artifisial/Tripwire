@@ -178,6 +178,51 @@ export const jira = {
     return { id: String(created.id), key: created.key, url: `${new URL(created.self).origin}/browse/${created.key}` };
   },
 
+  /**
+   * Moves the issue to a status in the Done category with the first matching transition. Returns the new status
+   * name, or undefined when the workflow offers no such transition from the current status.
+   */
+  async transitionToDone(key: string): Promise<string | undefined> {
+    const body = await request<{ transitions?: { id: string; to?: { name?: string; statusCategory?: { key?: string } } }[] }>(
+      'GET',
+      route`/rest/api/3/issue/${key}/transitions`,
+    );
+    const done = (body.transitions ?? []).find((t) => t.to?.statusCategory?.key === 'done');
+    if (!done) return undefined;
+    await request('POST', route`/rest/api/3/issue/${key}/transitions`, { transition: { id: done.id } });
+    return done.to?.name ?? 'Done';
+  },
+
+  /** Adds a comment (ADF body) to the issue. */
+  async addComment(key: string, body: AdfDoc): Promise<void> {
+    await request('POST', route`/rest/api/3/issue/${key}/comment`, { body });
+  },
+
+  /** Up to `max` issues matching `jql` with their summary and labels (enhanced search, paginated by token). */
+  async searchIssues(jql: string, max: number): Promise<{ key: string; summary: string; labels: string[] }[]> {
+    const found: { key: string; summary: string; labels: string[] }[] = [];
+    let nextPageToken: string | undefined;
+    do {
+      const page = await request<{ issues?: { key: string; fields?: { summary?: string; labels?: string[] } }[]; nextPageToken?: string }>(
+        'POST',
+        route`/rest/api/3/search/jql`,
+        { jql, fields: ['summary', 'labels'], maxResults: Math.min(100, max - found.length), ...(nextPageToken ? { nextPageToken } : {}) },
+      );
+      for (const issue of page.issues ?? []) {
+        found.push({ key: issue.key, summary: issue.fields?.summary ?? '', labels: issue.fields?.labels ?? [] });
+      }
+      nextPageToken = page.nextPageToken;
+    } while (nextPageToken && found.length < max);
+    return found.slice(0, max);
+  },
+
+  /** Adds and removes labels on one issue without touching its other labels. */
+  async updateLabels(key: string, add: readonly string[], remove: readonly string[]): Promise<void> {
+    await request('PUT', route`/rest/api/3/issue/${key}`, {
+      update: { labels: [...add.map((l) => ({ add: l })), ...remove.map((l) => ({ remove: l }))] },
+    });
+  },
+
   /** Undefined when the issue does not exist. */
   async getIssue(key: string): Promise<{ key: string; statusCategory?: string } | undefined> {
     try {

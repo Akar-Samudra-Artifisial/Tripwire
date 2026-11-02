@@ -75,17 +75,38 @@ const doc = (text: string): AdfDoc => ({
   content: [{ type: 'paragraph', content: [{ type: 'text', text }] }],
 });
 
-const ticket = (summary: string) => ({
+const ticket = (summary: string, extraLabels: string[] = []) => ({
   summary,
   description: doc('Demo support ticket created by Tripwire "Load demo data". The customer asks for a CSV export.'),
-  labels: [DEMO.label],
+  labels: [DEMO.label, ...extraLabels],
 });
+
+/** Extra label on "Simulate a busy month" tickets so "Reset demo" can tell them from the 7 baseline tickets. */
+export const SIM_LABEL = 'tripwire-demo-sim';
+
+/** Summary of busy month ticket `i` (0-based): `<one of BUSY_SUMMARIES> (#n)`. */
+const busySummary = (i: number): string => `${BUSY_SUMMARIES[i % BUSY_SUMMARIES.length]} (#${i + 1})`;
+
+/**
+ * Tickets made by "Simulate a busy month". Runs before `SIM_LABEL` existed left unlabelled tickets, so those are
+ * recognised by their exact generated summary (`<busy summary> (#1..30)`), which no baseline ticket has.
+ */
+export function isSimulatedTicket(issue: { summary: string; labels: readonly string[] }): boolean {
+  if (issue.labels.includes(SIM_LABEL)) return true;
+  const m = /^(.*) \(#(\d{1,3})\)$/.exec(issue.summary);
+  if (!m) return false;
+  const n = Number(m[2]);
+  return n >= 1 && n <= DEMO.busyMonthTickets && busySummary(n - 1) === issue.summary;
+}
 
 /** Raised for problems the admin can fix; the resolver shows the message as is. */
 export class SeedError extends Error {}
 
 export interface SeedDeps {
-  jira: Pick<typeof jiraAdapter, 'getProject' | 'createProject' | 'countIssues' | 'bulkCreateIssues'>;
+  jira: Pick<
+    typeof jiraAdapter,
+    'getProject' | 'createProject' | 'countIssues' | 'bulkCreateIssues' | 'searchIssues' | 'updateLabels' | 'transitionToDone' | 'addComment'
+  >;
   confluence: Pick<
     typeof confluenceAdapter,
     'findSpace' | 'createSpace' | 'findPageByTitle' | 'createPage' | 'getPageLabels' | 'addPageLabel' | 'canEditPage'
@@ -102,6 +123,10 @@ export interface SeedDeps {
     | 'releaseAppLock'
     | 'getAppValue'
     | 'setAppValue'
+    | 'deleteDecisionTree'
+    | 'casTripwire'
+    | 'acquirePageLock'
+    | 'releasePageLock'
   >;
   enqueueExtraction: (pageId: string, force: boolean, requestedBy?: string) => Promise<string>;
   evaluate: (ids: readonly string[]) => Promise<{ results: EvalOutcome[]; rateLimited: boolean }>;
@@ -114,16 +139,25 @@ interface DemoState {
   /** Set once "Simulate a busy month" created its tickets; later clicks only evaluate. */
   simulatedTickets?: number;
   simulatedAt?: string;
+  /** Keys of the busy month tickets, so "Reset demo" can relabel them without depending on Jira's search index. */
+  simulatedKeys?: string[];
+  /** Set when "Reset demo" already reset the decision but Jira search still counted the busy month tickets. */
+  resetPending?: boolean;
 }
+
+const ISSUE_KEY = /^[A-Z][A-Z0-9_]{0,9}-\d{1,9}$/;
 
 async function readDemoState(repo: SeedDeps['repo']): Promise<DemoState> {
   const raw = await repo.getAppValue(DEMO_STATE_KEY);
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const v = raw as Record<string, unknown>;
+  const keys = Array.isArray(v.simulatedKeys) ? v.simulatedKeys.filter((k): k is string => typeof k === 'string' && ISSUE_KEY.test(k)) : [];
   return {
     ...(typeof v.pageId === 'string' && /^\d{1,20}$/.test(v.pageId) ? { pageId: v.pageId } : {}),
     ...(typeof v.simulatedTickets === 'number' ? { simulatedTickets: v.simulatedTickets } : {}),
     ...(typeof v.simulatedAt === 'string' ? { simulatedAt: v.simulatedAt } : {}),
+    ...(keys.length > 0 ? { simulatedKeys: keys } : {}),
+    ...(v.resetPending === true ? { resetPending: true } : {}),
   };
 }
 
@@ -198,7 +232,7 @@ export async function loadDemoData(accountId: string, deps: SeedDeps): Promise<L
     const existing = projectCreated ? 0 : await jira.countIssues(DEMO_JQL);
     const missing = Math.max(0, DEMO.baselineTickets - existing);
     if (missing > 0) {
-      await jira.bulkCreateIssues(DEMO.projectKey, BASELINE_SUMMARIES.slice(0, missing).map(ticket));
+      await jira.bulkCreateIssues(DEMO.projectKey, BASELINE_SUMMARIES.slice(0, missing).map((s) => ticket(s)));
     }
 
     // Before the page exists, so its extraction already allows JQL in SUP.
@@ -289,6 +323,7 @@ export async function simulateBusyMonth(deps: SeedDeps): Promise<SimulateResult>
   const deadline = deps.now() + TIME_BUDGET_MS;
   const state = await readDemoState(repo);
   if (!state.pageId || !(await jira.getProject(DEMO.projectKey))) throw new SeedError('Run "Load demo data" first.');
+  if (state.resetPending) throw new SeedError(`"Reset demo" has not finished: ${INDEX_LAG_MESSAGE} Click "Reset demo" again.`);
   const decision = await repo.getDecisionByPage(state.pageId);
   const ids = decision ? (await repo.listTripwires(decision.id)).filter((t) => EVALUABLE_STATUSES.includes(t.status)).map((t) => t.id) : [];
   if (ids.length === 0) {
@@ -302,11 +337,16 @@ export async function simulateBusyMonth(deps: SeedDeps): Promise<SimulateResult>
       const before = await jira.countIssues(DEMO_JQL);
       const keys = await jira.bulkCreateIssues(
         DEMO.projectKey,
-        Array.from({ length: DEMO.busyMonthTickets }, (_, i) => ticket(`${BUSY_SUMMARIES[i % BUSY_SUMMARIES.length]} (#${i + 1})`)),
+        Array.from({ length: DEMO.busyMonthTickets }, (_, i) => ticket(busySummary(i), [SIM_LABEL])),
       );
       created = keys.length;
       target = before + created;
-      await repo.setAppValue(DEMO_STATE_KEY, { ...state, simulatedTickets: created, simulatedAt: new Date(deps.now()).toISOString() });
+      await repo.setAppValue(DEMO_STATE_KEY, {
+        ...state,
+        simulatedTickets: created,
+        simulatedKeys: keys,
+        simulatedAt: new Date(deps.now()).toISOString(),
+      });
     }
     const { count, indexed } = await waitForCount(target, deps);
 
@@ -329,4 +369,152 @@ export async function simulateBusyMonth(deps: SeedDeps): Promise<SimulateResult>
     const complete = passes.length === 2 && !passes.some((p) => p.rateLimited);
     return { created, issueCount: count, indexed, passes, complete, revisits };
   });
+}
+
+export interface ResetDemoResult {
+  /** Busy month tickets that lost the `export` label in this click. */
+  relabelled: number;
+  /** Demo tickets still counted by the demo JQL (the baseline). */
+  remaining: number;
+  /** Revisit issue of the demo decision that was closed, if one was open. */
+  revisitIssueKey?: string;
+  deleted: { tripwires: number; assumptions: number; evaluations: number; revisits: number } | null;
+  extractionJobId?: string;
+  /** False while Jira search has not caught up (busy month tickets missing or still counted): click again later. */
+  indexed: boolean;
+  /** False when the reset has to be repeated (time ran out or Jira search lagged); the simulate marker is kept then. */
+  complete: boolean;
+  /** Shown as is in the setup page when the reset is not complete. */
+  message?: string;
+  warnings: string[];
+}
+
+/** Most demo tickets "Reset demo" looks at (7 baseline + a few busy months). */
+const RESET_SCAN_MAX = 300;
+const RESET_PARALLEL = 5;
+export const INDEX_LAG_MESSAGE = 'Jira index still catching up, retry in a minute.';
+export const PAGE_BUSY_MESSAGE = 'The demo decision is busy (extraction or Revisit in progress), try again in a minute.';
+const TIME_UP_MESSAGE = 'Time ran out while relabelling tickets; click "Reset demo" again to finish.';
+/** Demo tickets in SUP, including busy month tickets that already lost the `export` label. */
+const RESET_JQL = `project = ${DEMO.projectKey} AND (labels = ${DEMO.label} OR labels = ${SIM_LABEL})`;
+/** Page locks shared with `openRevisit` and the extraction pipeline. */
+const RESET_PAGE_LOCKS = ['revisit', 'extract'] as const;
+const ARCHIVABLE = ['proposed', 'active', 'near', 'tripped', 'revisiting'] as const;
+
+const resetComment = (): AdfDoc => doc('Closed by Tripwire "Reset demo": the demo decision was reset to its freshly loaded state.');
+
+/**
+ * Puts the demo back to the state right after "Load demo data" so the story can be replayed: the busy month
+ * tickets lose the `export` label (they get `SIM_LABEL` instead, nothing is deleted), the demo decision's open
+ * Revisit issue is moved to Done, the demo decision and all its rows are deleted and the page is extracted
+ * again (its tripwire comes back as `proposed`), and the "simulated" marker is cleared once Jira search agrees.
+ * Only issues in SUP that `isSimulatedTicket` recognises and the decision of the remembered demo page are touched.
+ * Holds both demo app locks and the page's revisit/extract locks, so no evaluation, Revisit or extraction of the
+ * demo page can write rows while they are deleted.
+ */
+export async function resetDemo(accountId: string, deps: SeedDeps): Promise<ResetDemoResult> {
+  if (!/^[A-Za-z0-9:_-]{1,128}$/.test(accountId)) throw new SeedError('Unknown user.');
+  const { repo } = deps;
+  const state = await readDemoState(repo);
+  if (!state.pageId) throw new SeedError('Nothing to reset: run "Load demo data" first.');
+  const pageId = state.pageId;
+
+  // Load and Simulate locks: a reset racing either would leave half-counted tickets behind.
+  return withLock(deps, LOAD_LOCK, false, () =>
+    withLock(deps, SIMULATE_LOCK, false, async () => {
+      const held: (typeof RESET_PAGE_LOCKS)[number][] = [];
+      const release = async (): Promise<void> => {
+        for (const lock of held) {
+          await repo.releasePageLock(pageId, lock).catch((err: unknown) => {
+            console.warn('tripwire resetDemo: page lock release failed', { pageId, lock, error: err instanceof Error ? err.message : String(err) });
+          });
+        }
+      };
+      let result: ResetDemoResult;
+      try {
+        for (const lock of RESET_PAGE_LOCKS) {
+          if (!(await repo.acquirePageLock(pageId, lock, new Date(deps.now()).toISOString(), LOCK_SECONDS))) throw new SeedError(PAGE_BUSY_MESSAGE);
+          held.push(lock);
+        }
+        result = await resetLocked(pageId, state, deps);
+      } finally {
+        await release();
+      }
+      // After the locks are gone, or the extraction would find the page locked.
+      if (result.deleted) result.extractionJobId = await deps.enqueueExtraction(pageId, true, accountId);
+      return result;
+    }),
+  );
+}
+
+async function resetLocked(pageId: string, state: DemoState, deps: SeedDeps): Promise<ResetDemoResult> {
+  const { jira, repo } = deps;
+  const deadline = deps.now() + TIME_BUDGET_MS;
+  const warnings: string[] = [];
+  let relabelled = 0;
+  let remaining = 0;
+  const incomplete = (message: string, indexed: boolean): ResetDemoResult => ({ relabelled, remaining, deleted: null, indexed, complete: false, message, warnings });
+
+  if (await jira.getProject(DEMO.projectKey)) {
+    const tickets = await jira.searchIssues(RESET_JQL, RESET_SCAN_MAX);
+    const keys = new Set(state.simulatedKeys ?? []);
+    const simulated = tickets.filter((t) => keys.has(t.key) || isSimulatedTicket(t));
+    remaining = tickets.filter((t) => !simulated.includes(t) && t.labels.includes(DEMO.label)).length;
+    // Keys from Simulate are relabelled whether or not search sees them yet; found tickets only while they are counted.
+    const toRelabel = [...new Set([...keys, ...simulated.filter((t) => t.labels.includes(DEMO.label)).map((t) => t.key)])];
+    for (let i = 0; i < toRelabel.length; i += RESET_PARALLEL) {
+      if (deps.now() >= deadline) return incomplete(TIME_UP_MESSAGE, true);
+      const batch = toRelabel.slice(i, i + RESET_PARALLEL);
+      await Promise.all(batch.map((key) => jira.updateLabels(key, [SIM_LABEL], [DEMO.label])));
+      relabelled += batch.length;
+    }
+    // Without remembered keys, a busy month search cannot see yet would keep counting after the reset.
+    if (keys.size === 0 && state.simulatedTickets !== undefined && simulated.length < state.simulatedTickets) {
+      return incomplete(INDEX_LAG_MESSAGE, false);
+    }
+  }
+
+  let revisitIssueKey: string | undefined;
+  let deleted: ResetDemoResult['deleted'] = null;
+  const decision = state.resetPending ? undefined : await repo.getDecisionByPage(pageId);
+  if (decision) {
+    // Archive first: an evaluation that read the tripwire before the locks were taken then loses its CAS.
+    for (const t of await repo.listTripwires(decision.id)) {
+      await repo.casTripwire(t.id, ARCHIVABLE, { status: 'archived' });
+    }
+    const open = await repo.findOpenRevisit(decision.id);
+    if (open) {
+      revisitIssueKey = open.issueKey;
+      try {
+        if (!(await jira.transitionToDone(open.issueKey))) warnings.push(`${open.issueKey} has no transition to Done; close it in Jira.`);
+        await jira.addComment(open.issueKey, resetComment());
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('tripwire resetDemo: could not close Revisit issue', { issueKey: open.issueKey, error: msg });
+        warnings.push(`Could not close ${open.issueKey}: ${msg}`);
+      }
+    }
+    deleted = await repo.deleteDecisionTree(decision.id);
+  }
+
+  let indexed = true;
+  if (state.simulatedTickets !== undefined || relabelled > 0) {
+    const waitUntil = deps.now() + INDEX_WAIT_MS;
+    for (;;) {
+      if ((await jira.countIssues(DEMO_JQL)) <= remaining) break;
+      if (deps.now() >= waitUntil) {
+        indexed = false;
+        break;
+      }
+      await deps.sleep(INDEX_POLL_MS);
+    }
+  }
+  const base = { relabelled, remaining, ...(revisitIssueKey ? { revisitIssueKey } : {}), deleted, warnings };
+  if (!indexed) {
+    // Keep the marker: Simulate would otherwise start from a stale count. The decision is already reset.
+    await repo.setAppValue(DEMO_STATE_KEY, { ...state, resetPending: true });
+    return { ...base, indexed: false, complete: false, message: INDEX_LAG_MESSAGE };
+  }
+  await repo.setAppValue(DEMO_STATE_KEY, { pageId });
+  return { ...base, indexed: true, complete: true };
 }

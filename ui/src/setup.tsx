@@ -221,9 +221,82 @@ interface SimulateResult {
   revisits: { tripwireId: string; issueKey: string }[];
 }
 
+interface ResetDemoResult {
+  relabelled: number;
+  remaining: number;
+  revisitIssueKey?: string;
+  deleted: { tripwires: number; assumptions: number; evaluations: number; revisits: number } | null;
+  extractionJobId?: string;
+  indexed: boolean;
+  complete: boolean;
+  message?: string;
+  warnings: string[];
+}
+
+function ResetDemo({ disabled, onBusy }: { disabled: boolean; onBusy: (busy: boolean) => void }) {
+  const [state, setState] = useState<{ busy: boolean; confirming: boolean; result?: ResetDemoResult; error?: string }>({
+    busy: false,
+    confirming: false,
+  });
+  const run = () => {
+    // Two clicks instead of window.confirm: modals are not available in the Custom UI iframe.
+    if (!state.confirming) {
+      setState({ busy: false, confirming: true });
+      return;
+    }
+    setState({ busy: true, confirming: false });
+    onBusy(true);
+    call<ResetDemoResult>('resetDemo')
+      .then((result) => setState({ busy: false, confirming: false, result }))
+      .catch((e: unknown) => setState({ busy: false, confirming: false, error: message(e) }))
+      .finally(() => onBusy(false));
+  };
+  const r = state.result;
+  return (
+    <>
+      <p className="muted">
+        Resets the demo so it can be replayed: the busy month tickets lose the <code>export</code> label (nothing is deleted),
+        the demo Revisit task moves to Done, the "Defer CSV export" decision is cleared and extracted again (its tripwire is
+        proposed again). Nothing outside the demo is touched.
+      </p>
+      <div className="assumption__actions">
+        <button type="button" className="setup__button" onClick={run} disabled={disabled || state.busy}>
+          {state.busy ? 'Resetting…' : state.confirming ? 'Click again to reset the demo' : 'Reset demo'}
+        </button>
+        {state.confirming && (
+          <button type="button" className="setup__button" onClick={() => setState({ busy: false, confirming: false })}>
+            Cancel
+          </button>
+        )}
+      </div>
+      {r && (
+        <p role="status">
+          {r.complete ? 'Demo reset' : `Not finished: ${r.message ?? 'click Reset demo again'}`} · {r.relabelled} busy month tickets
+          relabelled · {r.remaining} export tickets left
+          {r.revisitIssueKey && ` · ${r.revisitIssueKey} closed`}
+          {r.deleted &&
+            ` · removed ${r.deleted.tripwires} tripwires, ${r.deleted.evaluations} evaluations, ${r.deleted.revisits} revisits`}
+          {r.extractionJobId && ' · extraction queued: open the page and accept its tripwire again'}
+        </p>
+      )}
+      {r?.warnings.map((w) => (
+        <p key={w} className="error" role="alert">
+          {w}
+        </p>
+      ))}
+      {state.error && (
+        <p className="error" role="alert">
+          {state.error}
+        </p>
+      )}
+    </>
+  );
+}
+
 function DemoData() {
   const [load, setLoad] = useState<{ busy: boolean; result?: LoadDemoResult; error?: string }>({ busy: false });
   const [sim, setSim] = useState<{ busy: boolean; result?: SimulateResult; error?: string }>({ busy: false });
+  const [resetting, setResetting] = useState(false);
   const runLoad = () => {
     setLoad({ busy: true });
     call<LoadDemoResult>('loadDemoData')
@@ -238,7 +311,7 @@ function DemoData() {
   };
   const l = load.result;
   const s = sim.result;
-  const busy = load.busy || sim.busy;
+  const busy = load.busy || sim.busy || resetting;
   return (
     <section className="setup__section">
       <h2 className="setup__heading">Demo data</h2>
@@ -297,6 +370,7 @@ function DemoData() {
           {sim.error}
         </p>
       )}
+      <ResetDemo disabled={load.busy || sim.busy} onBusy={setResetting} />
     </section>
   );
 }
