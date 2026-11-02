@@ -63,7 +63,7 @@ Rules:
 2. "quote" must be copied verbatim from the page (same words, same order). If you cannot quote it, do not include the assumption.
 3. An assumption is a condition the decision depends on and that could become false later.
 4. Map each assumption to exactly one kind:
-   - jql_threshold: a countable Jira condition. spec = {"jql": string, "op": ">"|">="|"<"|"<=", "value": number}. The condition TRIPS when \`count op value\` is true (e.g. "fewer than 10 requests a month" → op ">", value 10, jql with \`created >= -30d\`).
+   - jql_threshold: a countable Jira condition. spec = {"jql": string, "op": ">"|">="|"<"|"<=", "value": number}. The condition TRIPS when \`count op value\` is true (e.g. "fewer than 10 requests a month" → it stops holding at 10 → op ">=", value 10, jql with \`created >= -30d\`). Keep the page's boundary exactly: "N or more", "at least N", "reaches N" → op ">=" value N; "more than N", "over N", "exceeds N" → op ">" value N; "N or fewer", "at most N" → op "<=" value N; "fewer than N", "drops below N" → op "<" value N.
      JQL may only use fields: project, labels, issuetype, status, statusCategory, priority, component, created, resolved, updated, resolution, assignee, reporter. No ORDER BY, no history operators (WAS, CHANGED), no functions except startOfDay/startOfWeek/startOfMonth/startOfYear/endOfDay/endOfWeek/endOfMonth/endOfYear/now, and relative dates like -30d.
      ${projects}
    - date: a deadline or expiry. spec = {"date":"YYYY-MM-DD","leadDays":30}. Today is ${ctx.today}.
