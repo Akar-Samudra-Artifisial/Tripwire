@@ -123,7 +123,12 @@ p {
   background: var(--ds-background-neutral, #091e420f);
 }
 
-.badge--active {
+.badge--open {
+  background: var(--ds-background-information, #e9f2ff);
+}
+
+.badge--active,
+.badge--closed {
   background: var(--ds-background-success, #dcfff1);
 }
 

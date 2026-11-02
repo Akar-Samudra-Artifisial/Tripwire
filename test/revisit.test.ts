@@ -265,3 +265,30 @@ describe('evaluator + openRevisit', () => {
     expect(repo.tripwires.get(tripwireId)?.status).toBe('revisiting');
   });
 });
+
+describe('openRevisit vs a concurrent reset', () => {
+  it('writes nothing when the decision was deleted while it waited for the page lock', async () => {
+    const { tripwireId, decisionId } = seedTripwire(repo, { status: 'tripped', strikes: 2 });
+    const acquire = repo.acquirePageLock.bind(repo);
+    repo.acquirePageLock = async (...args) => {
+      await repo.deleteDecisionTree(decisionId);
+      return acquire(...args);
+    };
+    expect(await openRevisit(tripwireId, deps)).toEqual({ created: false, reason: 'not_found' });
+    expect(createIssue).not.toHaveBeenCalled();
+    expect(repo.revisits.size).toBe(0);
+    expect(repo.relations).toEqual([]);
+  });
+
+  it('stops when the tripwire was archived while it waited for the page lock', async () => {
+    const { tripwireId } = seedTripwire(repo, { status: 'tripped', strikes: 2 });
+    const acquire = repo.acquirePageLock.bind(repo);
+    repo.acquirePageLock = async (...args) => {
+      await repo.casTripwire(tripwireId, ['revisiting'], { status: 'archived' });
+      return acquire(...args);
+    };
+    expect(await openRevisit(tripwireId, deps)).toEqual({ created: false, reason: 'concurrent' });
+    expect(createIssue).not.toHaveBeenCalled();
+    expect(repo.revisits.size).toBe(0);
+  });
+});

@@ -76,8 +76,9 @@ modules:
       name: List tripped decisions
       function: list-tripped-fn
       actionVerb: GET
-      description: List decisions whose assumptions have tripped or are near their
-        threshold, with the current value, threshold and measurement date.
+      description: List decisions whose assumptions tripped (or are near), newest first,
+        with page link, assumption, last value vs threshold, status, Revisit work item
+        and measurement date. Only pages the user can view.
       inputs:
         team:
           title: Team
@@ -88,7 +89,7 @@ modules:
           title: Status
           type: string
           required: false
-          description: "Filter by status: tripped or near."
+          description: "tripped (default: tripped or being revisited), near, or all."
 
   # --- Storage and AI (adding these later forces a major version upgrade) ---
   sql:

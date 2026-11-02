@@ -3,11 +3,12 @@ import Resolver from '@forge/resolver';
 import { confluence } from '../adapters/confluence';
 import { jira } from '../adapters/jira';
 import { sqlRepo, type DecisionRow, type EvaluationRow, type RevisitRow, type TripwirePatch, type TripwireRow } from '../adapters/repo';
-import { loadDemoData, SeedError, simulateBusyMonth, type SeedDeps } from '../adapters/seed';
+import { loadDemoData, resetDemo, SeedError, simulateBusyMonth, type SeedDeps } from '../adapters/seed';
 import { ensureSchema, listAppliedMigrations } from '../adapters/sql';
 import { EvaluationRateLimitedError, evaluateMany, summarise, type EvalOutcome } from '../core/evaluator';
 import { jqlGuard, toCheckin } from '../core/extraction';
 import { LATEST_MIGRATION } from '../core/migrations';
+import { reaffirmRevisit, suggestThreshold, type ReaffirmInput } from '../core/revisit';
 import { normaliseSettings, SettingsError, type Settings } from '../core/settings';
 import { EVALUABLE_STATUSES } from '../core/state';
 import { validateSpec } from '../core/triggers';
@@ -131,6 +132,15 @@ resolver.define('simulateBusyMonth', ({ context }) =>
     await ensureSchema();
     const result = await simulateBusyMonth(seedDeps);
     console.info('tripwire simulateBusyMonth', { created: result.created, issueCount: result.issueCount, indexed: result.indexed, complete: result.complete, passes: result.passes, revisits: result.revisits.length });
+    return result;
+  }),
+);
+
+resolver.define('resetDemo', ({ context }) =>
+  adminOnly(context, 'Reset demo', async () => {
+    await ensureSchema();
+    const result = await resetDemo((context as ResolverContext).accountId as string, seedDeps);
+    console.info('tripwire resetDemo', { ...result, warnings: result.warnings.length });
     return result;
   }),
 );
@@ -288,18 +298,55 @@ resolver.define('getRevisit', async ({ context }) => {
     const revisit = await sqlRepo.getRevisitByIssue(issueKey);
     const found = revisit?.tripwireId ? await sqlRepo.getTripwireContext(revisit.tripwireId) : undefined;
     if (!revisit || !found) return { error: 'This work item is not a Tripwire revisit task.' };
+    // The decision, assumption, JQL and readings come from a Confluence page: only show them to people who can view it.
+    let page: Awaited<ReturnType<typeof confluence.viewPageAsUser>>;
+    try {
+      page = await confluence.viewPageAsUser(found.decision.pageId);
+    } catch (err) {
+      if (err instanceof Error && isForgePlatformError(err)) throw err;
+      console.warn('Tripwire getRevisit: page access check failed', { pageId: found.decision.pageId, error: String(err) });
+      page = undefined;
+    }
+    if (!page) return restrictedRevisit(revisit);
     const evaluations = await sqlRepo.listEvaluations(found.tripwire.id, 30);
-    const pageUrl = await confluence
-      .getPage(found.decision.pageId)
-      .then((p) => p.webUrl)
-      .catch((err: unknown) => {
-        console.warn('Tripwire getRevisit: page link unavailable', { pageId: found.decision.pageId, error: String(err) });
-        return undefined;
-      });
-    return { revisit, ...found, evaluations, pageUrl };
+    return { revisit, ...found, evaluations, pageUrl: page.webUrl, suggestedThreshold: suggestedFor(found.tripwire) };
   } catch (err) {
+    // e.g. NeedsAuthenticationError from asUser(): the bridge turns it into the consent prompt.
+    if (err instanceof Error && isForgePlatformError(err)) throw err;
     console.error('Tripwire Load revisit failed', err);
     return { error: 'Load revisit failed. Check the app logs.' };
+  }
+});
+
+export const NO_PAGE_ACCESS = "You don't have access to the decision page.";
+
+/** Revisit view for someone who cannot view the decision page: status only, nothing taken from the page. */
+export function restrictedRevisit(revisit: RevisitRow): { restricted: true; message: string; revisit: Pick<RevisitRow, 'issueKey' | 'status' | 'createdAt'> } {
+  return { restricted: true, message: NO_PAGE_ACCESS, revisit: { issueKey: revisit.issueKey, status: revisit.status, createdAt: revisit.createdAt } };
+}
+
+function suggestedFor(tripwire: TripwireRow): number | undefined {
+  if (tripwire.kind !== 'jql_threshold' && tripwire.kind !== 'graph_relation') return undefined;
+  return suggestThreshold(tripwire.lastValue, (tripwire.spec as { value: number }).value);
+}
+
+resolver.define('reaffirmRevisit', async ({ payload, context }) => {
+  const ctx = context as ResolverContext;
+  // The issue comes from the panel context, never from the payload.
+  const issueKey = ctx.extension?.issue?.key;
+  if (ctx.moduleKey !== REVISIT_MODULE || !issueKey || !ctx.accountId) return { error: 'Reaffirm is only available on a Jira work item.' };
+  try {
+    await ensureSchema();
+    const input = (payload ?? {}) as ReaffirmInput;
+    return await reaffirmRevisit(issueKey, ctx.accountId, { newThreshold: input.newThreshold, note: input.note }, {
+      repo: sqlRepo,
+      jira,
+      canEditPage: (pageId) => confluence.canEditPage(pageId),
+    });
+  } catch (err) {
+    if (err instanceof Error && isForgePlatformError(err)) throw err;
+    console.error('Tripwire Reaffirm failed', err);
+    return { error: 'Reaffirm failed. Check the app logs.' };
   }
 });
 

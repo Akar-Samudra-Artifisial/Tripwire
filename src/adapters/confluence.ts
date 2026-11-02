@@ -27,11 +27,11 @@ async function readJson<T>(res: APIResponse, what: string): Promise<T> {
 
 export const confluence = {
   async getPage(pageId: string, withBody = false): Promise<PageSummary> {
-    const res = await api
-      .asApp()
-      .requestConfluence(route`/wiki/api/v2/pages/${pageId}?body-format=${withBody ? 'storage' : 'none'}`, {
-        headers: { Accept: 'application/json' },
-      });
+    // Confluence v2 rejects `body-format=none` with 400; omit the parameter when no body is needed.
+    const path = withBody
+      ? route`/wiki/api/v2/pages/${pageId}?body-format=storage`
+      : route`/wiki/api/v2/pages/${pageId}`;
+    const res = await api.asApp().requestConfluence(path, { headers: { Accept: 'application/json' } });
     const page = await readJson<RawPage>(res, `get page ${pageId}`);
     const links = page._links;
     return {
@@ -70,6 +70,20 @@ export const confluence = {
     if (res.status === 401 || res.status === 403 || res.status === 404) return false;
     const body = await readJson<{ operations?: { operation?: string; targetType?: string }[] }>(res, `get operations of page ${pageId}`);
     return (body.operations ?? []).some((o) => o.operation === 'update');
+  },
+
+  /**
+   * The page as the current user sees it: undefined when they cannot view it (401/403/404). Runs as the user
+   * (resolvers and Rovo actions only); platform errors such as missing consent propagate.
+   */
+  async viewPageAsUser(pageId: string): Promise<{ title: string; webUrl?: string } | undefined> {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (res.status === 401 || res.status === 403 || res.status === 404) return undefined;
+    const page = await readJson<RawPage>(res, `view page ${pageId}`);
+    const links = page._links;
+    return { title: page.title, webUrl: links?.base && links.webui ? `${links.base}${links.webui}` : undefined };
   },
 
   /** The space with this key, or undefined. */

@@ -5,8 +5,22 @@ import { seedTripwire } from './helpers/seed';
 
 vi.mock('@forge/api', () => ({ default: {}, route: () => '' }));
 
-const { BUSY_MESSAGE, DEMO, DEMO_JQL, DEMO_STATE_KEY, demoSettings, LOAD_LOCK, loadDemoData, SeedError, SIMULATE_LOCK, simulateBusyMonth, TIME_BUDGET_MS } =
-  await import('../src/adapters/seed');
+const {
+  BUSY_MESSAGE,
+  DEMO,
+  DEMO_JQL,
+  DEMO_STATE_KEY,
+  demoSettings,
+  INDEX_LAG_MESSAGE,
+  LOAD_LOCK,
+  loadDemoData,
+  PAGE_BUSY_MESSAGE,
+  resetDemo,
+  SeedError,
+  SIMULATE_LOCK,
+  simulateBusyMonth,
+  TIME_BUDGET_MS,
+} = await import('../src/adapters/seed');
 const { SettingsError } = await import('../src/core/settings');
 type SeedDeps = import('../src/adapters/seed').SeedDeps;
 
@@ -18,22 +32,51 @@ interface World {
   space?: { id: string; key: string };
   page?: { id: string; webUrl?: string };
   labels: string[];
+  /** Issues Jira search does not see yet (index lag). */
+  hidden?: Set<string>;
+  /** Extra tickets the approximate count still reports (index lag after relabelling). */
+  countLag?: number;
 }
 
 function makeDeps(world: World, repo: FakeRepo, evaluate?: SeedDeps['evaluate']) {
   let clock = Date.parse('2026-11-02T10:00:00Z');
+  // Every SUP issue; `world.tickets` stays the number labelled `export` (what the demo JQL counts).
+  const issues: { key: string; summary: string; labels: string[] }[] = Array.from({ length: world.tickets }, (_, i) => ({
+    key: `SUP-${i + 1}`,
+    summary: `Baseline ticket ${i + 1}`,
+    labels: ['export'],
+  }));
   const jira = {
     getProject: vi.fn(async (key: string) => (world.project ? { id: '10000', key, name: DEMO.projectName } : undefined)),
     createProject: vi.fn(async (input: { key: string }) => {
       world.project = true;
       return { id: '10000', key: input.key };
     }),
-    countIssues: vi.fn(async () => world.tickets),
-    bulkCreateIssues: vi.fn(async (_key: string, issues: readonly unknown[]) => {
-      const keys = issues.map((_, i) => `SUP-${world.tickets + i + 1}`);
-      world.tickets += issues.length;
+    countIssues: vi.fn(async () => world.tickets + (world.countLag ?? 0)),
+    bulkCreateIssues: vi.fn(async (_key: string, created: readonly { summary: string; labels: string[] }[]) => {
+      const keys = created.map((n) => {
+        const key = `SUP-${issues.length + 1}`;
+        issues.push({ key, summary: n.summary, labels: [...n.labels] });
+        return key;
+      });
+      world.tickets += created.length;
       return keys;
     }),
+    searchIssues: vi.fn(async (jql: string, max: number) =>
+      issues
+        .filter((i) => !world.hidden?.has(i.key))
+        .filter((i) => i.labels.includes('export') || (jql.includes('tripwire-demo-sim') && i.labels.includes('tripwire-demo-sim')))
+        .slice(0, max)
+        .map((i) => structuredClone(i)),
+    ),
+    updateLabels: vi.fn(async (key: string, add: readonly string[], remove: readonly string[]) => {
+      const issue = issues.find((i) => i.key === key)!;
+      const had = issue.labels.includes('export');
+      issue.labels = [...issue.labels.filter((l) => !remove.includes(l)), ...add.filter((l) => !issue.labels.includes(l))];
+      if (had && !issue.labels.includes('export')) world.tickets -= 1;
+    }),
+    transitionToDone: vi.fn(async (): Promise<string | undefined> => 'Done'),
+    addComment: vi.fn(async () => undefined),
   };
   const confluence = {
     findSpace: vi.fn(async () => world.space),
@@ -60,7 +103,7 @@ function makeDeps(world: World, repo: FakeRepo, evaluate?: SeedDeps['evaluate'])
   const advance = (ms: number) => {
     clock += ms;
   };
-  return { deps, jira, confluence, advance };
+  return { deps, jira, confluence, advance, issues };
 }
 
 /** Demo page with a confirmed tripwire, as after "Load demo data" + Accept. */
@@ -276,5 +319,204 @@ describe('simulateBusyMonth', () => {
     seedTripwire(repo, { status: 'active' });
     const { deps } = makeDeps({ project: true, tickets: 0, labels: [] }, repo);
     await expect(simulateBusyMonth(deps)).rejects.toThrow(/Load demo data/);
+  });
+});
+
+describe('resetDemo', () => {
+  /** Demo decision after Simulate: tripwire revisiting, 2 evaluations, an open Revisit, 30 busy month tickets. */
+  async function simulatedWorld() {
+    const { decisionId, tripwireId, assumptionId } = demoTripwire(repo);
+    const other = seedTripwire(repo, { status: 'revisiting' }); // another decision: must survive the reset
+    await repo.insertRevisit({ id: 'rv-other', decisionId: other.decisionId, issueKey: 'OPS-5', tripwireId: other.tripwireId, status: 'open' });
+    const world: World = { project: true, tickets: 7, labels: [] };
+    const made = makeDeps(world, repo, tripping(decisionId));
+    await simulateBusyMonth(made.deps);
+    await repo.insertRelation({ type: 'invalidated-by', fromId: assumptionId, toId: 'SUP-99' });
+    await repo.insertEvaluation({ id: 'ev-other', tripwireId: other.tripwireId, value: 5, outcome: 'safe', evaluatedAt: '2026-11-01T00:00:00.000Z' });
+    const pageId = repo.decisions.get(decisionId)!.pageId;
+    return { ...made, world, decisionId, tripwireId, other, pageId };
+  }
+
+  const tripping = (decisionId: string) => {
+    let pass = 0;
+    return vi.fn(async (ids: readonly string[]) => {
+      pass += 1;
+      for (const id of ids) {
+        await repo.insertEvaluation({ id: `ev-${id}-${pass}`, tripwireId: id, value: 37, outcome: 'tripped', evaluatedAt: `2026-11-0${pass}T00:00:00.000Z` });
+        if (pass === 2) await repo.casTripwire(id, ['active'], { status: 'revisiting', strikes: 2 });
+      }
+      if (pass === 2) await repo.insertRevisit({ id: 'rv-1', decisionId, issueKey: 'SUP-99', tripwireId: ids[0], status: 'open' });
+      const results: EvalOutcome[] = ids.map((id) => ({
+        status: 'evaluated',
+        tripwireId: id,
+        outcome: 'tripped',
+        value: 37,
+        newStatus: pass === 1 ? 'near' : 'tripped',
+        revisitRequested: pass === 2,
+      }));
+      return { results, rateLimited: false };
+    });
+  };
+
+  it('isSimulatedTicket recognises the label or the exact generated summary only', async () => {
+    const { isSimulatedTicket, SIM_LABEL } = await import('../src/adapters/seed');
+    expect(isSimulatedTicket({ summary: 'anything', labels: ['export', SIM_LABEL] })).toBe(true);
+    expect(isSimulatedTicket({ summary: 'CSV export needed for quarterly board pack (#1)', labels: ['export'] })).toBe(true);
+    expect(isSimulatedTicket({ summary: 'Customer escalation: no way to export report data (#2)', labels: ['export'] })).toBe(true);
+    // Wrong pairing of summary and number, out of range, or a baseline ticket: not a simulated ticket.
+    expect(isSimulatedTicket({ summary: 'CSV export needed for quarterly board pack (#2)', labels: ['export'] })).toBe(false);
+    expect(isSimulatedTicket({ summary: 'CSV export needed for quarterly board pack (#31)', labels: ['export'] })).toBe(false);
+    expect(isSimulatedTicket({ summary: 'Need CSV export for finance reconciliation', labels: ['export'] })).toBe(false);
+  });
+
+  it('new busy month tickets carry the simulation label', async () => {
+    demoTripwire(repo);
+    const { deps, jira } = makeDeps({ project: true, tickets: 7, labels: [] }, repo);
+    await simulateBusyMonth(deps);
+    expect(jira.bulkCreateIssues.mock.calls[0]?.[1]?.[0]).toMatchObject({ labels: ['export', 'tripwire-demo-sim'] });
+  });
+
+  it('removes only demo data: busy month tickets, demo Revisit, demo decision rows and the simulate marker', async () => {
+    const w = await simulatedWorld();
+    // An unlabelled ticket from an old run (summary pattern) and a ticket a person added by hand.
+    w.issues.push({ key: 'SUP-200', summary: 'Export dashboard widgets to CSV (#3)', labels: ['export'] });
+    w.issues.push({ key: 'SUP-201', summary: 'Real customer: CSV please', labels: ['export'] });
+    const cas = vi.spyOn(repo, 'casTripwire');
+    const result = await resetDemo(ACCOUNT, w.deps);
+
+    expect(w.jira.searchIssues).toHaveBeenCalledWith('project = SUP AND (labels = export OR labels = tripwire-demo-sim)', expect.any(Number));
+    // Archived before the rows go, so an evaluation that read the tripwire earlier loses its CAS.
+    expect(cas).toHaveBeenCalledWith(w.tripwireId, expect.arrayContaining(['revisiting', 'active']), { status: 'archived' });
+    expect(result).toMatchObject({ relabelled: 31, remaining: 8, revisitIssueKey: 'SUP-99', complete: true, indexed: true, warnings: [] });
+    expect(result.deleted).toEqual({ tripwires: 1, assumptions: 1, evaluations: 2, revisits: 1 });
+    expect(w.issues.filter((i) => i.labels.includes('export')).map((i) => i.key)).toEqual([
+      'SUP-1', 'SUP-2', 'SUP-3', 'SUP-4', 'SUP-5', 'SUP-6', 'SUP-7', 'SUP-201',
+    ]);
+    expect(w.jira.updateLabels).toHaveBeenCalledWith('SUP-200', ['tripwire-demo-sim'], ['export']);
+    expect(w.jira.transitionToDone).toHaveBeenCalledTimes(1);
+    expect(w.jira.transitionToDone).toHaveBeenCalledWith('SUP-99');
+    expect(w.jira.addComment).toHaveBeenCalledWith('SUP-99', expect.anything());
+    // Demo decision gone, the other decision untouched.
+    expect(repo.decisions.has(w.decisionId)).toBe(false);
+    expect(repo.tripwires.has(w.tripwireId)).toBe(false);
+    expect(repo.relations).toHaveLength(0);
+    expect(repo.tripwires.get(w.other.tripwireId)?.status).toBe('revisiting');
+    expect(repo.revisits.get('rv-other')?.status).toBe('open');
+    expect(repo.evaluations.map((e) => e.id)).toEqual(['ev-other']);
+    expect(repo.appValues.get(DEMO_STATE_KEY)).toEqual({ pageId: expect.any(String) });
+    expect(w.deps.enqueueExtraction).toHaveBeenLastCalledWith(expect.any(String), true, ACCOUNT);
+    expect(repo.appLocks.has(SIMULATE_LOCK)).toBe(false);
+    expect(repo.appLocks.has(LOAD_LOCK)).toBe(false);
+  });
+
+  it('relabels remembered busy month tickets by key even when search does not see them yet', async () => {
+    const w = await simulatedWorld();
+    w.world.hidden = new Set(['SUP-8', 'SUP-9']);
+    const result = await resetDemo(ACCOUNT, w.deps);
+    expect(w.jira.updateLabels).toHaveBeenCalledWith('SUP-8', ['tripwire-demo-sim'], ['export']);
+    expect(result).toMatchObject({ relabelled: 30, complete: true, indexed: true });
+  });
+
+  it('keeps the marker and the decision when search has not caught up with the busy month (no remembered keys)', async () => {
+    const w = await simulatedWorld();
+    // State written before Simulate remembered keys.
+    repo.appValues.set(DEMO_STATE_KEY, { pageId: w.pageId, simulatedTickets: 30 });
+    w.world.hidden = new Set(['SUP-30', 'SUP-31', 'SUP-32']);
+    const result = await resetDemo(ACCOUNT, w.deps);
+    expect(result).toMatchObject({ complete: false, indexed: false, deleted: null, message: INDEX_LAG_MESSAGE, relabelled: 27 });
+    expect(repo.appValues.get(DEMO_STATE_KEY)).toEqual({ pageId: w.pageId, simulatedTickets: 30 });
+    expect(repo.decisions.has(w.decisionId)).toBe(true);
+    expect(w.deps.enqueueExtraction).not.toHaveBeenCalledWith(w.pageId, true, ACCOUNT);
+    // A minute later search sees them: the reset finishes.
+    w.world.hidden = undefined;
+    expect(await resetDemo(ACCOUNT, w.deps)).toMatchObject({ complete: true, indexed: true, relabelled: 3 });
+    expect(repo.appValues.get(DEMO_STATE_KEY)).toEqual({ pageId: w.pageId });
+  });
+
+  it('when the count still includes the relabelled tickets, keeps the marker, blocks Simulate and finishes on the next click', async () => {
+    const w = await simulatedWorld();
+    w.world.countLag = 30;
+    const first = await resetDemo(ACCOUNT, w.deps);
+    expect(first).toMatchObject({ complete: false, indexed: false, message: INDEX_LAG_MESSAGE, deleted: { tripwires: 1 } });
+    expect(repo.decisions.has(w.decisionId)).toBe(false);
+    expect(repo.appValues.get(DEMO_STATE_KEY)).toMatchObject({ simulatedTickets: 30, resetPending: true });
+    expect(w.deps.enqueueExtraction).toHaveBeenLastCalledWith(w.pageId, true, ACCOUNT);
+    await expect(simulateBusyMonth(w.deps)).rejects.toThrow(/Reset demo" has not finished/);
+
+    // Extraction recreated the decision meanwhile; the second click must not delete it again.
+    const fresh = seedTripwire(repo, { decisionId: 'dec-fresh', status: 'proposed' });
+    repo.decisions.set('dec-fresh', { ...repo.decisions.get('dec-fresh')!, pageId: w.pageId });
+    w.world.countLag = 0;
+    vi.mocked(w.deps.enqueueExtraction).mockClear();
+    const second = await resetDemo(ACCOUNT, w.deps);
+    expect(second).toMatchObject({ complete: true, indexed: true, deleted: null });
+    expect(repo.tripwires.get(fresh.tripwireId)?.status).toBe('proposed');
+    expect(w.deps.enqueueExtraction).not.toHaveBeenCalled();
+    expect(repo.appValues.get(DEMO_STATE_KEY)).toEqual({ pageId: w.pageId });
+  });
+
+  it.each(['revisit', 'extract'] as const)('refuses while the demo page %s lock is held, touching nothing', async (lock) => {
+    const w = await simulatedWorld();
+    repo.pageLocks.set(w.pageId, { [lock]: '2099-01-01T00:00:00.000Z' });
+    await expect(resetDemo(ACCOUNT, w.deps)).rejects.toThrow(PAGE_BUSY_MESSAGE);
+    expect(w.jira.updateLabels).not.toHaveBeenCalled();
+    expect(repo.decisions.has(w.decisionId)).toBe(true);
+    expect(repo.appValues.get(DEMO_STATE_KEY)).toMatchObject({ simulatedTickets: 30 });
+    // Its own locks are released, the other holder's lock is kept.
+    expect(repo.pageLocks.get(w.pageId)?.[lock]).toBe('2099-01-01T00:00:00.000Z');
+    expect(repo.pageLocks.get(w.pageId)?.[lock === 'revisit' ? 'extract' : 'revisit']).toBeUndefined();
+    expect(repo.appLocks.has(SIMULATE_LOCK)).toBe(false);
+    expect(repo.appLocks.has(LOAD_LOCK)).toBe(false);
+  });
+
+  it('refuses while "Load demo data" runs', async () => {
+    const w = await simulatedWorld();
+    repo.appLocks.set(LOAD_LOCK, '2099-01-01T00:00:00.000Z');
+    await expect(resetDemo(ACCOUNT, w.deps)).rejects.toThrow(BUSY_MESSAGE);
+    expect(w.jira.updateLabels).not.toHaveBeenCalled();
+  });
+
+  it('lets Simulate run again afterwards and open a new Revisit', async () => {
+    const w = await simulatedWorld();
+    await resetDemo(ACCOUNT, w.deps);
+    // Extraction + Accept again: a fresh confirmed tripwire on the demo page.
+    const pageId = (repo.appValues.get(DEMO_STATE_KEY) as { pageId: string }).pageId;
+    const decisionId = 'dec-again';
+    repo.decisions.set(decisionId, { id: decisionId, pageId, statement: 'Defer CSV export', topics: [], status: 'active' });
+    const fresh = seedTripwire(repo, { decisionId });
+    w.jira.bulkCreateIssues.mockClear();
+    w.deps.evaluate = vi.fn(async (ids: readonly string[]) => {
+      if (!(await repo.findOpenRevisit(decisionId))) await repo.insertRevisit({ id: 'rv-again', decisionId, issueKey: 'SUP-140', tripwireId: ids[0], status: 'open' });
+      return { results: ids.map((id) => ({ status: 'evaluated' as const, tripwireId: id, outcome: 'tripped' as const, value: 37, newStatus: 'tripped' as const, revisitRequested: true })), rateLimited: false };
+    });
+    const again = await simulateBusyMonth(w.deps);
+    expect(w.jira.bulkCreateIssues.mock.calls[0]?.[1]).toHaveLength(30);
+    expect(again).toMatchObject({ created: 30, issueCount: 37, indexed: true, revisits: [{ tripwireId: fresh.tripwireId, issueKey: 'SUP-140' }] });
+  });
+
+  it('keeps going when the Revisit issue cannot be closed and reports a warning', async () => {
+    const w = await simulatedWorld();
+    w.jira.transitionToDone.mockRejectedValueOnce(new Error('Jira 403: no permission'));
+    const result = await resetDemo(ACCOUNT, w.deps);
+    expect(result.complete).toBe(true);
+    expect(result.warnings).toEqual(['Could not close SUP-99: Jira 403: no permission']);
+    expect(repo.decisions.has(w.decisionId)).toBe(false);
+  });
+
+  it('stops before touching SQL when time runs out while relabelling', async () => {
+    const w = await simulatedWorld();
+    w.jira.updateLabels.mockImplementation(async () => w.advance(TIME_BUDGET_MS));
+    const result = await resetDemo(ACCOUNT, w.deps);
+    expect(result).toMatchObject({ complete: false, relabelled: 5, deleted: null, message: expect.stringContaining('Time ran out') });
+    expect(repo.decisions.has(w.decisionId)).toBe(true);
+    expect(repo.appValues.get(DEMO_STATE_KEY)).toMatchObject({ simulatedTickets: 30 });
+  });
+
+  it('refuses before "Load demo data" and while Simulate runs', async () => {
+    const { deps } = makeDeps({ project: true, tickets: 7, labels: [] }, repo);
+    await expect(resetDemo(ACCOUNT, deps)).rejects.toThrow(/Load demo data/);
+    demoTripwire(repo);
+    repo.appLocks.set(SIMULATE_LOCK, '2099-01-01T00:00:00.000Z');
+    await expect(resetDemo(ACCOUNT, deps)).rejects.toThrow(BUSY_MESSAGE);
   });
 });

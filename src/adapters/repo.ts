@@ -60,6 +60,22 @@ export interface RevisitClose {
   supersededByDecisionId?: string;
 }
 
+/** One tripwire with its assumption, decision and open Revisit issue (for the Rovo `list-tripped` action). */
+export interface WatchRow {
+  tripwire: TripwireRow;
+  assumption: Assumption;
+  decision: Pick<DecisionRow, 'id' | 'pageId' | 'statement' | 'title' | 'team' | 'ownerAccountId'>;
+  revisitIssueKey?: string;
+}
+
+/** Rows removed by `deleteDecisionTree`. */
+export interface DeletedTree {
+  tripwires: number;
+  assumptions: number;
+  evaluations: number;
+  revisits: number;
+}
+
 /** Per-page timestamps on `decisions`: a scan cooldown and two short-lived locks (see `acquirePageLock`). */
 export type PageLock = 'scan' | 'extract' | 'revisit';
 
@@ -90,8 +106,16 @@ export interface Repo {
   findOpenRevisit(decisionId: string): Promise<RevisitRow | undefined>;
   getRevisitByIssue(issueKey: string): Promise<RevisitRow | undefined>;
   insertRevisit(r: Omit<RevisitRow, 'createdAt'>): Promise<void>;
-  closeRevisit(id: string, patch: RevisitClose): Promise<void>;
+  /** Closes an open revisit; false when it was not open any more (someone else closed it first). */
+  closeRevisit(id: string, patch: RevisitClose): Promise<boolean>;
   insertRelation(r: Omit<Relation, 'id' | 'createdAt'>): Promise<void>;
+  /**
+   * Tripwires in `statuses`, most recently evaluated first, with their decision and open Revisit issue.
+   * `team` (case-insensitive) is applied before `limit`.
+   */
+  listWatchRows(statuses: readonly TripwireStatus[], limit: number, team?: string): Promise<WatchRow[]>;
+  /** Deletes a decision row and everything hanging off it (assumptions, tripwires, evaluations, revisits, relations). */
+  deleteDecisionTree(decisionId: string): Promise<DeletedTree>;
   /**
    * Atomically takes `lock` for the page until now + `seconds` (creating a placeholder decision row if needed).
    * False when another holder's time has not run out yet.
@@ -465,9 +489,9 @@ export const sqlRepo: Repo = {
   },
 
   async closeRevisit(id, patch) {
-    await execute(
+    const affected = await execute(
       `UPDATE revisits SET status = 'closed', outcome = ?, resolved_by = ?, resolved_at = ?, new_threshold = ?, superseded_by_decision_id = ?
-       WHERE id = ?`,
+       WHERE id = ? AND status = 'open'`,
       patch.outcome,
       patch.resolvedBy,
       toSqlTs(new Date().toISOString()),
@@ -475,10 +499,77 @@ export const sqlRepo: Repo = {
       patch.supersededByDecisionId ?? null,
       id,
     );
+    return affected === 1;
   },
 
   async insertRelation(r) {
     await execute('INSERT INTO relations (id, type, from_id, to_id) VALUES (?, ?, ?, ?)', randomUUID(), r.type, r.fromId, r.toId);
+  },
+
+  async listWatchRows(statuses, limit, team) {
+    if (statuses.length === 0) return [];
+    const teamFilter = team ? ' AND LOWER(d.team) = ?' : '';
+    const rows = await query<Row>(
+      `SELECT ${TRIPWIRE_COLS}, a.decision_id AS a_decision_id, a.quote AS a_quote, a.summary AS a_summary,
+         d.page_id AS d_page_id, d.statement AS d_statement, d.title AS d_title, d.team AS d_team, d.owner_account_id AS d_owner,
+         r.issue_key AS r_issue_key
+       FROM tripwires t
+       JOIN assumptions a ON a.id = t.assumption_id
+       JOIN decisions d ON d.id = a.decision_id
+       LEFT JOIN revisits r ON r.decision_id = d.id AND r.status = 'open'
+       WHERE t.status IN (${placeholders(statuses.length)})${teamFilter}
+       ORDER BY t.last_evaluated_at DESC, t.id LIMIT ${sqlInt(limit, 0, 500)}`,
+      ...statuses,
+      ...(team ? [team.toLowerCase()] : []),
+    );
+    const seen = new Set<string>();
+    const out: WatchRow[] = [];
+    for (const row of rows) {
+      const tripwire = toTripwire(row);
+      // Two open revisits for one decision should not exist; never list a tripwire twice if they do.
+      if (seen.has(tripwire.id)) continue;
+      seen.add(tripwire.id);
+      out.push({
+        tripwire,
+        assumption: toAssumption({ id: row.assumption_id, decision_id: row.a_decision_id, quote: row.a_quote, summary: row.a_summary }),
+        decision: {
+          id: String(row.a_decision_id),
+          pageId: String(row.d_page_id),
+          statement: String(row.d_statement ?? ''),
+          title: str(row.d_title),
+          team: str(row.d_team),
+          ownerAccountId: str(row.d_owner),
+        },
+        ...(row.r_issue_key ? { revisitIssueKey: String(row.r_issue_key) } : {}),
+      });
+    }
+    return out;
+  },
+
+  async deleteDecisionTree(decisionId) {
+    const assumptionIds = (await query<Row>('SELECT id FROM assumptions WHERE decision_id = ?', decisionId)).map((r) => String(r.id));
+    const tripwireIds =
+      assumptionIds.length > 0
+        ? (await query<Row>(`SELECT id FROM tripwires WHERE assumption_id IN (${placeholders(assumptionIds.length)})`, ...assumptionIds)).map((r) =>
+            String(r.id),
+          )
+        : [];
+    const revisitKeys = (await query<Row>('SELECT issue_key FROM revisits WHERE decision_id = ?', decisionId)).map((r) => String(r.issue_key));
+    // Children first, the decision row last: a failed run can be repeated and still finds everything by decision id.
+    const evaluations =
+      tripwireIds.length > 0 ? await execute(`DELETE FROM evaluations WHERE tripwire_id IN (${placeholders(tripwireIds.length)})`, ...tripwireIds) : 0;
+    const relationIds = [decisionId, ...assumptionIds, ...revisitKeys];
+    await execute(
+      `DELETE FROM relations WHERE from_id IN (${placeholders(relationIds.length)}) OR to_id IN (${placeholders(relationIds.length)})`,
+      ...relationIds,
+      ...relationIds,
+    );
+    const tripwires =
+      tripwireIds.length > 0 ? await execute(`DELETE FROM tripwires WHERE id IN (${placeholders(tripwireIds.length)})`, ...tripwireIds) : 0;
+    const revisits = await execute('DELETE FROM revisits WHERE decision_id = ?', decisionId);
+    const assumptions = await execute('DELETE FROM assumptions WHERE decision_id = ?', decisionId);
+    await execute('DELETE FROM decisions WHERE id = ?', decisionId);
+    return { tripwires, assumptions, evaluations, revisits };
   },
 
   async acquirePageLock(pageId, lock, nowIso, seconds) {

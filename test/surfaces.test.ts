@@ -6,6 +6,7 @@ const forge = vi.hoisted(() => ({
   defs: new Map<string, (req: { payload?: unknown; context: unknown }) => unknown>(),
   push: vi.fn(),
   canEditPage: vi.fn<(pageId: string) => Promise<boolean>>(),
+  viewPageAsUser: vi.fn<(pageId: string) => Promise<{ title: string; webUrl?: string } | undefined>>(),
   evaluateMany: vi.fn(),
   repo: { current: undefined as unknown },
 }));
@@ -41,7 +42,9 @@ vi.mock('../src/adapters/sql', () => ({
   query: vi.fn(),
   execute: vi.fn(),
 }));
-vi.mock('../src/adapters/confluence', () => ({ confluence: { canEditPage: forge.canEditPage, getPage: vi.fn() } }));
+vi.mock('../src/adapters/confluence', () => ({
+  confluence: { canEditPage: forge.canEditPage, getPage: vi.fn(), viewPageAsUser: forge.viewPageAsUser },
+}));
 vi.mock('../src/adapters/repo', async (importActual) => ({
   ...(await importActual<typeof import('../src/adapters/repo')>()),
   get sqlRepo() {
@@ -78,6 +81,7 @@ beforeEach(() => {
   forge.repo.current = repo;
   forge.push.mockReset().mockResolvedValue({ jobId: 'job-1' });
   forge.canEditPage.mockReset().mockResolvedValue(true);
+  forge.viewPageAsUser.mockReset().mockResolvedValue({ title: 'Defer CSV export', webUrl: 'https://site/wiki/pages/1' });
   forge.evaluateMany.mockReset();
 });
 
@@ -179,5 +183,84 @@ describe('retryLater', () => {
     expect(options.retryAfter).toBe(30);
     expect(options.retryData).toEqual({ reason: 'locked' });
     expect((retryLater(60) as unknown as { options: { retryData?: unknown } }).options.retryData).toBeDefined();
+  });
+});
+
+describe('reaffirmRevisit resolver', () => {
+  const panel = (payload: unknown, extra: Record<string, unknown> = {}) => {
+    const fn = forge.defs.get('reaffirmRevisit')!;
+    return fn({
+      payload,
+      context: { moduleKey: 'tripwire-revisit', accountId: 'owner-1', extension: { issue: { key: 'SUP-38' } }, ...extra },
+    }) as Promise<Record<string, unknown>>;
+  };
+
+  it('takes the issue key from the panel context, never from the payload', async () => {
+    const a = seedTripwire(repo, { status: 'revisiting' });
+    const b = seedTripwire(repo, { status: 'revisiting' });
+    await repo.insertRevisit({ id: 'rv-a', decisionId: a.decisionId, issueKey: 'SUP-38', tripwireId: a.tripwireId, status: 'open' });
+    await repo.insertRevisit({ id: 'rv-b', decisionId: b.decisionId, issueKey: 'SUP-77', tripwireId: b.tripwireId, status: 'open' });
+    const result = await panel({ newThreshold: 45, issueKey: 'SUP-77' });
+    expect(result).toMatchObject({ reaffirmed: true, issueKey: 'SUP-38' });
+    expect(repo.revisits.get('rv-a')?.status).toBe('closed');
+    expect(repo.revisits.get('rv-b')?.status).toBe('open');
+  });
+
+  it('refuses outside the Jira issue panel', async () => {
+    expect(await panel({ newThreshold: 45 }, { moduleKey: 'tripwire-byline' })).toEqual({ error: 'Reaffirm is only available on a Jira work item.' });
+  });
+
+  it('checks page edit access as the user, owner included', async () => {
+    const a = seedTripwire(repo, { status: 'revisiting' });
+    await repo.insertRevisit({ id: 'rv-a', decisionId: a.decisionId, issueKey: 'SUP-38', tripwireId: a.tripwireId, status: 'open' });
+    forge.canEditPage.mockResolvedValue(false);
+    for (const accountId of ['owner-1', 'someone-else']) {
+      expect(await panel({ newThreshold: 45 }, { accountId })).toEqual({ error: 'Only people who can edit the decision page can reaffirm it.' });
+    }
+    expect(forge.canEditPage).toHaveBeenCalledWith(repo.decisions.get(a.decisionId)!.pageId);
+    expect(repo.revisits.get('rv-a')?.status).toBe('open');
+  });
+});
+
+describe('getRevisit resolver (W1)', () => {
+  const panel = () =>
+    forge.defs.get('getRevisit')!({ context: { moduleKey: 'tripwire-revisit', accountId: 'user-1', extension: { issue: { key: 'SUP-38' } } } }) as Promise<
+      Record<string, unknown>
+    >;
+  const withRevisit = async () => {
+    const a = seedTripwire(repo, { status: 'revisiting', quote: 'secret quote from the page' });
+    await repo.insertEvaluation({ id: 'ev-1', tripwireId: a.tripwireId, value: 37, outcome: 'tripped', evaluatedAt: '2026-11-01T00:00:00.000Z' });
+    await repo.insertRevisit({ id: 'rv-a', decisionId: a.decisionId, issueKey: 'SUP-38', tripwireId: a.tripwireId, status: 'open' });
+    return { ...a, pageId: repo.decisions.get(a.decisionId)!.pageId };
+  };
+  const expectRedacted = (result: Record<string, unknown>) => {
+    expect(result).toEqual({ restricted: true, message: "You don't have access to the decision page.", revisit: { issueKey: 'SUP-38', status: 'open', createdAt: expect.any(String) } });
+    const json = JSON.stringify(result);
+    for (const leak of ['secret quote', 'project = SUP', 'Defer CSV export', 'https://']) expect(json).not.toContain(leak);
+  };
+
+  it('shows decision, assumption, tripwire, evaluations and the page link to people who can view the page', async () => {
+    const { pageId } = await withRevisit();
+    const result = await panel();
+    expect(forge.viewPageAsUser).toHaveBeenCalledWith(pageId);
+    expect(result).toMatchObject({ assumption: { quote: 'secret quote from the page' }, pageUrl: 'https://site/wiki/pages/1', evaluations: [{ id: 'ev-1' }] });
+  });
+
+  it('redacts everything from the page when the user cannot view it', async () => {
+    await withRevisit();
+    forge.viewPageAsUser.mockResolvedValue(undefined);
+    expectRedacted(await panel());
+  });
+
+  it('fails closed when the access check errors', async () => {
+    await withRevisit();
+    forge.viewPageAsUser.mockRejectedValue(new Error('Confluence 500'));
+    expectRedacted(await panel());
+  });
+
+  it('lets the consent prompt through', async () => {
+    await withRevisit();
+    forge.viewPageAsUser.mockRejectedValue(Object.assign(new Error('needs auth'), { name: 'NeedsAuthenticationError' }));
+    await expect(panel()).rejects.toThrow('needs auth');
   });
 });

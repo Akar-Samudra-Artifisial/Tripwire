@@ -144,7 +144,7 @@ export function fakeRepo(): FakeRepo {
     },
     async closeRevisit(id, patch) {
       const current = repo.revisits.get(id);
-      if (!current) return;
+      if (!current || current.status !== 'open') return false;
       repo.revisits.set(id, {
         ...current,
         status: 'closed',
@@ -154,10 +154,55 @@ export function fakeRepo(): FakeRepo {
         newThreshold: patch.newThreshold,
         supersededByDecisionId: patch.supersededByDecisionId,
       });
+      return true;
     },
 
     async insertRelation(r) {
       repo.relations.push({ ...clone(r), id: randomUUID(), createdAt: new Date().toISOString() });
+    },
+
+    async listWatchRows(statuses, limit, team) {
+      const sec = (iso: string | null) => (iso ? Date.parse(iso) : -Infinity);
+      const teamOf = (assumptionId: string): string | undefined => {
+        const a = repo.assumptions.get(assumptionId);
+        return (a && repo.decisions.get(a.decisionId)?.team)?.toLowerCase();
+      };
+      return [...repo.tripwires.values()]
+        .filter((t) => statuses.includes(t.status))
+        .filter((t) => !team || teamOf(t.assumptionId) === team.toLowerCase())
+        .sort((a, b) => sec(b.lastEvaluatedAt) - sec(a.lastEvaluatedAt) || a.id.localeCompare(b.id))
+        .slice(0, limit)
+        .flatMap((t) => {
+          const assumption = repo.assumptions.get(t.assumptionId);
+          const decision = assumption && repo.decisions.get(assumption.decisionId);
+          if (!assumption || !decision) return [];
+          const open = [...repo.revisits.values()].find((r) => r.decisionId === decision.id && r.status === 'open');
+          const { id, pageId, statement, title, team, ownerAccountId } = decision;
+          return [
+            {
+              tripwire: clone(t),
+              assumption: clone(assumption),
+              decision: { id, pageId, statement, title, team, ownerAccountId },
+              ...(open ? { revisitIssueKey: open.issueKey } : {}),
+            },
+          ];
+        });
+    },
+    async deleteDecisionTree(decisionId) {
+      const assumptionIds = [...repo.assumptions.values()].filter((a) => a.decisionId === decisionId).map((a) => a.id);
+      const tripwireIds = [...repo.tripwires.values()].filter((t) => assumptionIds.includes(t.assumptionId)).map((t) => t.id);
+      const revisitIds = [...repo.revisits.values()].filter((r) => r.decisionId === decisionId);
+      const linked = new Set([decisionId, ...assumptionIds, ...revisitIds.map((r) => r.issueKey)]);
+      const evaluations = repo.evaluations.filter((e) => tripwireIds.includes(e.tripwireId)).length;
+      repo.evaluations = repo.evaluations.filter((e) => !tripwireIds.includes(e.tripwireId));
+      repo.relations = repo.relations.filter((r) => !linked.has(r.fromId) && !linked.has(r.toId));
+      for (const id of tripwireIds) repo.tripwires.delete(id);
+      for (const r of revisitIds) repo.revisits.delete(r.id);
+      for (const id of assumptionIds) repo.assumptions.delete(id);
+      const page = repo.decisions.get(decisionId)?.pageId;
+      repo.decisions.delete(decisionId);
+      if (page) repo.pageLocks.delete(page);
+      return { tripwires: tripwireIds.length, assumptions: assumptionIds.length, evaluations, revisits: revisitIds.length };
     },
 
     async acquirePageLock(pageId, lock, nowIso, seconds) {
