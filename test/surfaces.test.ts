@@ -14,6 +14,8 @@ const forge = vi.hoisted(() => ({
   canAdministerSpace: vi.fn<(spaceId: string) => Promise<boolean>>(),
   repo: { current: undefined as unknown },
   ensureSchema: vi.fn<() => Promise<void>>(),
+  getPageAsUser: vi.fn<(pageId: string) => Promise<{ title: string; version: number; body: string } | undefined>>(),
+  updatePageAsUser: vi.fn<(pageId: string, page: { title: string; body: string; version: number; message: string }) => Promise<number>>(),
 }));
 
 vi.mock('@forge/resolver', () => ({
@@ -55,6 +57,8 @@ vi.mock('../src/adapters/confluence', () => ({
     getPageLabels: async () => [],
     findSpace: forge.findSpace,
     canAdministerSpace: forge.canAdministerSpace,
+    getPageAsUser: forge.getPageAsUser,
+    updatePageAsUser: forge.updatePageAsUser,
   },
 }));
 vi.mock('../src/adapters/jira', async (importActual) => {
@@ -476,6 +480,21 @@ describe('demo buttons: queued job + polling', () => {
     const polled = (await admin('getDemoJob')) as { job: Record<string, unknown> };
     expect(polled.job).toMatchObject({ id: job.id, status: 'failed', error: 'Run "Load demo data" first.' });
     expect(repo.appLocks.has(DEMO_JOB_LOCK)).toBe(false);
+  });
+
+  it('stampDemoReviews notes the demo pages as the admin, admin-only and not while a demo job runs', async () => {
+    repo.appValues.set('demo', { pageId: '501', pages: { 'csv-export': '501', 'go-services': '502' } });
+    forge.canEditPage.mockImplementation(async (id) => id === '501');
+    forge.getPageAsUser.mockReset().mockResolvedValue({ title: 'Defer CSV export', version: 3, body: '<p>x</p>' });
+    forge.updatePageAsUser.mockReset().mockResolvedValue(4);
+    expect(await admin('stampDemoReviews')).toEqual({ stamped: 1, skipped: 1, failed: 0, pending: 0, graphCachesCleared: 0 });
+    expect(forge.updatePageAsUser).toHaveBeenCalledWith('501', expect.objectContaining({ version: 4, body: expect.stringContaining('ri:account-id="admin-1"') }));
+
+    await admin('loadDemoData');
+    expect(await admin('stampDemoReviews')).toEqual({ error: 'A demo job is still running, try again when it is done.' });
+    forge.isAdmin.mockResolvedValue(false);
+    expect(await admin('stampDemoReviews')).toEqual({ error: 'Only Jira administrators can add demo review notes.' });
+    expect(forge.updatePageAsUser).toHaveBeenCalledTimes(1);
   });
 
   it('consumer page access comes from the resolver check (no asUser in a queue consumer)', async () => {

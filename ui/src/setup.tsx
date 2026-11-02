@@ -304,6 +304,19 @@ interface DemoJob {
 /** How often the page checks a running demo job. */
 const DEMO_POLL_MS = 4000;
 
+/** Reply of `stampDemoReviews`. */
+interface StampResult {
+  stamped: number;
+  skipped: number;
+  failed: number;
+  pending: number;
+  graphCachesCleared: number;
+}
+
+/** Pages still being extracted after Load are stamped on a later try (15 s apart, about 3 minutes in all). */
+const STAMP_RETRY_MS = 15_000;
+const STAMP_TRIES = 12;
+
 const RESOLVERS: Record<DemoJobKind, string> = { load: 'loadDemoData', simulate: 'simulateBusyMonth', reset: 'resetDemo' };
 const RUNNING: Record<DemoJobKind, string> = { load: 'Loading demo data', simulate: 'Simulating a busy month', reset: 'Resetting the demo' };
 
@@ -421,6 +434,36 @@ function DemoData({ ready }: { ready: number }) {
     return () => clearTimeout(timer);
   }, [active, retry]);
 
+  // A Load seen running on this page gets the "Reviewed by" notes once it is done.
+  const loadSeenRunning = useRef<string | undefined>(undefined);
+  const [stamp, setStamp] = useState<{ busy: boolean; tries: number; result?: StampResult; error?: string }>({ busy: false, tries: 0 });
+  const runStamp = (tries: number) => {
+    setStamp((prev) => ({ ...prev, busy: true, tries, error: undefined }));
+    call<StampResult>('stampDemoReviews')
+      .then((r) =>
+        setStamp((prev) => {
+          // Pages stamped on an earlier try come back as skipped (already noted): count them as stamped.
+          const earlier = tries > 1 ? (prev.result?.stamped ?? 0) : 0;
+          return { busy: false, tries, result: { ...r, stamped: r.stamped + earlier, skipped: Math.max(0, r.skipped - earlier) } };
+        }),
+      )
+      .catch((e: unknown) => setStamp({ busy: false, tries, error: message(e) }));
+  };
+  useEffect(() => {
+    const job = jobs.load;
+    if (job && isActive(job)) loadSeenRunning.current = job.id;
+    else if (job?.status === 'done' && loadSeenRunning.current === job.id) {
+      loadSeenRunning.current = undefined;
+      runStamp(1);
+    }
+  }, [jobs.load]);
+  // Pages still being extracted are stamped on a later try.
+  useEffect(() => {
+    if (stamp.busy || !stamp.result || stamp.result.pending === 0 || stamp.tries >= STAMP_TRIES) return;
+    const timer = setTimeout(() => runStamp(stamp.tries + 1), STAMP_RETRY_MS);
+    return () => clearTimeout(timer);
+  }, [stamp]);
+
   const start = (kind: DemoJobKind) => {
     setStarting(kind);
     setErrors((prev) => ({ ...prev, [kind]: undefined }));
@@ -477,6 +520,22 @@ function DemoData({ ready }: { ready: number }) {
         <p className="error" role="alert">
           You cannot edit the demo page, so you cannot accept its tripwire. Give yourself access in the {l.spaceKey} space
           permissions (Tripwire created the space as the app).
+        </p>
+      )}
+      {(stamp.busy || stamp.result) && (
+        <p role="status" className="muted">
+          {stamp.busy && !stamp.result
+            ? 'Adding "Reviewed by" notes to the demo pages as you…'
+            : stamp.result &&
+              `"Reviewed by" added to ${stamp.result.stamped} page${stamp.result.stamped === 1 ? '' : 's'} as you (Teamwork Graph contributor for the Radar)` +
+                (stamp.result.skipped > 0 ? ` · ${stamp.result.skipped} skipped (already noted or not editable)` : '') +
+                (stamp.result.pending > 0 ? ` · ${stamp.result.pending} still being extracted${stamp.tries < STAMP_TRIES ? ', retrying' : ''}` : '') +
+                (stamp.result.failed > 0 ? ` · ${stamp.result.failed} failed (see app logs)` : '')}
+        </p>
+      )}
+      {stamp.error && (
+        <p className="error" role="alert">
+          "Reviewed by" notes not added: {stamp.error}
         </p>
       )}
       <JobError job={jobs.load} error={errors.load} />
