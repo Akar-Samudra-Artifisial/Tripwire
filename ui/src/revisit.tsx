@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { describeSpec, formatReading } from '../../src/core/describe';
+import { describeSpec, describeValue, formatReading } from '../../src/core/describe';
 import type { TripwireKind } from '../../src/core/types';
 import { call, useRemote } from './bridge';
 import { ErrorText, Shell, StatusBadge } from './components';
@@ -243,7 +243,7 @@ function Revisit() {
         <ul className="trend__list">
           {evaluations.map((e) => (
             <li key={e.id}>
-              {e.evaluatedAt.slice(0, 10)} · {e.value ?? '—'} · {e.outcome}
+              {e.evaluatedAt.slice(0, 10)} · {describeValue(tripwire.kind, tripwire.spec, e.value)} · {e.outcome}
             </li>
           ))}
         </ul>

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { JiraError, JiraUnavailableError, type AdfDoc, type jira } from '../adapters/jira';
 import type { DecisionRow, EvaluationRow, Repo, RevisitRow, TripwireContext, TripwirePatch } from '../adapters/repo';
-import { describeSpec, formatReading } from './describe';
+import { describeSpec, describeValue, formatReading } from './describe';
 import { PERIOD_DAYS } from './triggers/checkin';
 import type { CheckinSpec, DateSpec, TripwireKind } from './types';
 
@@ -79,7 +79,7 @@ export function revisitDescription(ctx: TripwireContext, evaluations: readonly E
     ? paragraph(text(statement), text(' — '), text('open decision page', [{ type: 'link', attrs: { href: pageUrl } }]))
     : paragraph(text(statement));
   const held = Math.max(trippedRun(evaluations), tripwire.strikes);
-  const history = evaluations.slice(0, 5).map((e) => `${e.evaluatedAt.slice(0, 10)} · ${e.value ?? '—'} · ${e.outcome}`);
+  const history = evaluations.slice(0, 5).map((e) => `${e.evaluatedAt.slice(0, 10)} · ${describeValue(tripwire.kind, tripwire.spec, e.value)} · ${e.outcome}`);
   return {
     type: 'doc',
     version: 1,
@@ -390,7 +390,9 @@ async function openLocked(ctx: TripwireContext, deps: RevisitDeps, rollback: () 
   const tripwireId = ctx.tripwire.id;
   const existing = await repo.findOpenRevisit(decision.id);
   if (existing) {
-    await repo.insertRelation({ type: 'invalidated-by', fromId: assumption.id, toId: existing.issueKey });
+    // One open Revisit per decision. Unless it is this tripwire's own, stay `tripped` (not `revisiting` on
+    // someone else's issue): the next evaluation retries and opens our own once that Revisit is closed.
+    if (existing.tripwireId !== undefined && existing.tripwireId !== tripwireId) await rollback();
     return { created: false, reason: 'already_open', issueKey: existing.issueKey };
   }
 

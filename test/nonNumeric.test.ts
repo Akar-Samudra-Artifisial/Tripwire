@@ -9,7 +9,7 @@ const checkin = await import('../src/core/triggers/checkin');
 const date = await import('../src/core/triggers/date');
 const { contentChangeReading } = await import('../src/core/triggers/content_change');
 const { validateSpec } = await import('../src/core/triggers');
-const { formatReading, describeSpec } = await import('../src/core/describe');
+const { formatReading, describeSpec, describeValue } = await import('../src/core/describe');
 const { fakeRepo } = await import('./helpers/fakeRepo');
 const { seedTripwire } = await import('./helpers/seed');
 
@@ -80,6 +80,17 @@ describe('content_change trigger', () => {
     expect(contentChangeReading(5)).toMatchObject({ outcome: 'safe', value: 5 });
     expect(contentChangeReading(5, 5)).toMatchObject({ outcome: 'safe' });
     expect(contentChangeReading(6, 5)).toMatchObject({ outcome: 'tripped', value: 6 });
+  });
+});
+
+describe('describeValue (Trend lines)', () => {
+  it('describes past readings in words instead of raw numbers like -1', () => {
+    expect(describeValue('date', { date: '2026-11-01', leadDays: 30 }, -1)).toBe('1 day past 2026-11-01');
+    expect(describeValue('date', { date: '2026-11-01', leadDays: 30, resolved: true }, -1)).toBe('1 day past 2026-11-01');
+    expect(describeValue('jql_threshold', { jql: 'x', op: '>', value: 10 }, 37)).toBe('37');
+    expect(describeValue('checkin', { every: 'quarter', question: 'q' }, null)).toBe('—');
+    expect(describeValue('checkin', { every: 'quarter', question: 'q' }, 3)).not.toBe('3');
+    expect(describeValue('content_change', { pageId: '1', watch: 'any_edit' }, 6)).not.toBe('6');
   });
 });
 
