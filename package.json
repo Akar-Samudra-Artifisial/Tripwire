@@ -1,0 +1,37 @@
+{
+  "name": "tripwire",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tripwire watches the assumptions behind your team's decisions and reopens a decision when the data says it's no longer true",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ui",
+    "build:ui": "node scripts/build-ui.mjs",
+    "build": "npm run typecheck && npm run build:ui",
+    "lint": "forge lint",
+    "deploy": "npm run build:ui && forge deploy"
+  },
+  "dependencies": {
+    "@forge/api": "^8.4.0",
+    "@forge/events": "^3.0.9",
+    "@forge/llm": "^1.0.9",
+    "@forge/resolver": "^2.0.2",
+    "@forge/sql": "^4.0.9",
+    "@forge/teamwork-graph": "^5.3.2"
+  },
+  "devDependencies": {
+    "@forge/bridge": "^7.2.1",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.28.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

@@ -1,0 +1,145 @@
+app:
+  id: ari:cloud:ecosystem::app/8d1eb26f-a9da-4d4e-81f3-1b2bf96a1726
+  runtime:
+    name: nodejs24.x
+  compatibility:
+    confluence:
+      required: true
+    jira:
+      required: false
+
+modules:
+  # --- Confluence ---
+  confluence:contentBylineItem:
+    - key: tripwire-byline
+      title: Tripwire
+      resource: byline-ui
+      resolver:
+        function: ui-resolver
+  confluence:globalPage:
+    - key: tripwire-health
+      title: Decision Health
+      route: decision-health
+      resource: health-ui
+      resolver:
+        function: ui-resolver
+
+  # --- Jira ---
+  jira:issuePanel:
+    - key: tripwire-revisit
+      title: Decision revisit
+      icon: resource:icons;tripwire.svg
+      resource: revisit-ui
+      resolver:
+        function: ui-resolver
+  jira:adminPage:
+    - key: tripwire-setup
+      title: Tripwire setup
+      resource: setup-ui
+      resolver:
+        function: ui-resolver
+
+  # --- Events and background work ---
+  trigger:
+    - key: on-page-change
+      function: on-page-event
+      events:
+        - avi:confluence:created:page
+        - avi:confluence:updated:page
+  scheduledTrigger:
+    - key: daily-evaluate
+      function: schedule-evaluation
+      interval: day
+  consumer:
+    - key: extract-consumer
+      queue: extract
+      function: extract-decision
+    - key: evaluate-consumer
+      queue: evaluate
+      function: evaluate-batch
+
+  # --- Rovo ---
+  rovo:agent:
+    - key: decision-steward
+      name: Decision Steward
+      description: Watches the assumptions behind your team's decisions and tells you
+        which decisions rest on outdated assumptions.
+      prompt: resource:agent-prompt;prompt.md
+      conversationStarters:
+        - Which of our decisions rest on outdated assumptions?
+        - Add tripwires to this decision page
+        - Does any team's decision contradict ours?
+      actions:
+        - list-tripped
+  action:
+    - key: list-tripped
+      name: List tripped decisions
+      function: list-tripped-fn
+      actionVerb: GET
+      description: List decisions whose assumptions have tripped or are near their
+        threshold, with the current value, threshold and measurement date.
+      inputs:
+        team:
+          title: Team
+          type: string
+          required: false
+          description: Only return decisions owned by this team.
+        status:
+          title: Status
+          type: string
+          required: false
+          description: "Filter by status: tripped or near."
+
+  # --- Storage and AI (adding these later forces a major version upgrade) ---
+  sql:
+    - key: main
+      engine: mysql
+  llm:
+    - key: tripwire-llm
+      model:
+        - claude
+
+  function:
+    - key: ui-resolver
+      handler: index.uiResolver
+    - key: on-page-event
+      handler: index.onPageEvent
+    - key: schedule-evaluation
+      handler: index.scheduleEvaluation
+    - key: extract-decision
+      handler: index.extractDecision
+      timeoutSeconds: 900
+    - key: evaluate-batch
+      handler: index.evaluateBatch
+      timeoutSeconds: 900
+    - key: list-tripped-fn
+      handler: index.listTripped
+
+resources:
+  - key: byline-ui
+    path: static/byline/build
+  - key: health-ui
+    path: static/health/build
+  - key: revisit-ui
+    path: static/revisit/build
+  - key: setup-ui
+    path: static/setup/build
+  - key: agent-prompt
+    path: prompts
+  - key: icons
+    path: static/icons
+
+permissions:
+  scopes:
+    - read:confluence-content.all
+    - read:confluence-content.summary  # page created/updated events
+    - read:page:confluence
+    - write:confluence-content
+    - read:jira-work
+    - write:jira-work
+    - storage:app
+    # Teamwork Graph (Preview, read-only; a missing scope returns empty data, not an error)
+    - read:graph:issue:jira
+    - read:graph:project:jira
+    - read:graph:user:atlassian
+    - read:graph:page:confluence
