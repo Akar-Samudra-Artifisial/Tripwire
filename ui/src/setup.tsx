@@ -200,21 +200,38 @@ function RunEvaluation() {
   );
 }
 
+interface LoadDemoPage {
+  slug: string;
+  title: string;
+  team: string;
+  pageId: string;
+  pageUrl?: string;
+  created: boolean;
+  extractionQueued: boolean;
+}
+
 interface LoadDemoResult {
   projectKey: string;
   revisitProjectKey: string;
   issueCount: number;
+  billingIssueCount: number;
   spaceKey: string;
   pageId: string;
   pageUrl?: string;
+  pages: LoadDemoPage[];
+  complete: boolean;
   canEdit: boolean | null;
   extractionJobId?: string;
-  created: { project: boolean; issues: number; space: boolean; page: boolean; label: boolean };
+  extractionsQueued: number;
+  created: { project: boolean; issues: number; billingIssues: number; space: boolean; page: boolean; label: boolean; pages: number };
 }
 
 interface SimulateResult {
   created: number;
   issueCount: number;
+  billingIssueCount: number;
+  confirmed: number;
+  queued: number;
   indexed: boolean;
   complete: boolean;
   passes: { evaluated: number; skipped: number; errors: number; revisits: number; total: number; rateLimited: boolean }[];
@@ -224,9 +241,11 @@ interface SimulateResult {
 interface ResetDemoResult {
   relabelled: number;
   remaining: number;
-  revisitIssueKey?: string;
+  revisitIssueKeys: string[];
   deleted: { tripwires: number; assumptions: number; evaluations: number; revisits: number } | null;
+  decisionsReset: number;
   extractionJobId?: string;
+  extractionsQueued: number;
   indexed: boolean;
   complete: boolean;
   message?: string;
@@ -255,9 +274,10 @@ function ResetDemo({ disabled, onBusy }: { disabled: boolean; onBusy: (busy: boo
   return (
     <>
       <p className="muted">
-        Resets the demo so it can be replayed: the busy month tickets lose the <code>export</code> label (nothing is deleted),
-        the demo Revisit task moves to Done, the "Defer CSV export" decision is cleared and extracted again (its tripwire is
-        proposed again). Nothing outside the demo is touched.
+        Resets the demo so it can be replayed: the busy month tickets lose the <code>export</code>/<code>billing</code> label
+        (nothing is deleted), the demo Revisit tasks move to Done, all eight demo decisions and their Radar pairs are cleared,
+        the Lumora pages get today's dates again and every page is extracted again (tripwires are proposed again). Nothing
+        outside the demo is touched.
       </p>
       <div className="assumption__actions">
         <button type="button" className="setup__button" onClick={run} disabled={disabled || state.busy}>
@@ -272,11 +292,12 @@ function ResetDemo({ disabled, onBusy }: { disabled: boolean; onBusy: (busy: boo
       {r && (
         <p role="status">
           {r.complete ? 'Demo reset' : `Not finished: ${r.message ?? 'click Reset demo again'}`} · {r.relabelled} busy month tickets
-          relabelled · {r.remaining} export tickets left
-          {r.revisitIssueKey && ` · ${r.revisitIssueKey} closed`}
+          relabelled · {r.remaining} export tickets left · {r.decisionsReset} decisions reset
+          {r.revisitIssueKeys.length > 0 && ` · ${r.revisitIssueKeys.join(', ')} closed`}
           {r.deleted &&
             ` · removed ${r.deleted.tripwires} tripwires, ${r.deleted.evaluations} evaluations, ${r.deleted.revisits} revisits`}
-          {r.extractionJobId && ' · extraction queued: open the page and accept its tripwire again'}
+          {r.extractionsQueued > 0 &&
+            ` · ${r.extractionsQueued} extractions queued: open "Defer CSV export" and accept its tripwire again`}
         </p>
       )}
       {r?.warnings.map((w) => (
@@ -316,27 +337,40 @@ function DemoData() {
     <section className="setup__section">
       <h2 className="setup__heading">Demo data</h2>
       <p className="muted">
-        Creates Jira project SUP with 7 tickets labelled <code>export</code>, Confluence space Decisions with the page "Defer CSV
-        export" (label <code>decision</code>), and points the settings at SUP. Safe to run more than once.
+        Creates the Lumora demo: Jira project SUP with 7 tickets labelled <code>export</code> and 2 labelled <code>billing</code>,
+        Confluence space Decisions with eight decision pages from seven teams (label <code>decision</code>), starting with "Defer
+        CSV export", and points the settings at SUP. Three pairs of pages contradict each other for the Radar. Safe to run more
+        than once.
       </p>
       <button type="button" className="setup__button" onClick={runLoad} disabled={busy}>
         {load.busy ? 'Loading…' : 'Load demo data'}
       </button>
       {l && (
-        <p role="status">
-          {l.projectKey}: {l.issueCount} export tickets ({l.created.issues} new{l.created.project && ', project created'}) · page{' '}
-          {l.pageUrl ? (
-            <a href={l.pageUrl} target="_blank" rel="noreferrer">
-              Defer CSV export
-            </a>
-          ) : (
-            <code>{l.pageId}</code>
-          )}{' '}
-          in {l.spaceKey}
-          {l.created.page && ' (created)'}
-          {l.extractionJobId && ' · extraction queued: open the page and accept its tripwire'}
-          {l.revisitProjectKey !== l.projectKey && ` · Revisit tasks go to ${l.revisitProjectKey} (your setting)`}
-        </p>
+        <>
+          <p role="status">
+            {l.projectKey}: {l.issueCount} export and {l.billingIssueCount} billing tickets (
+            {l.created.issues + l.created.billingIssues} new{l.created.project && ', project created'}) · {l.pages.length} decision
+            pages in {l.spaceKey} ({l.created.pages} created) · {l.extractionsQueued} extractions queued
+            {l.extractionJobId && ': open "Defer CSV export" and accept its tripwire'}
+            {l.revisitProjectKey !== l.projectKey && ` · Revisit tasks go to ${l.revisitProjectKey} (your setting)`}
+            {!l.complete && ' · not finished: click Load demo data again in a minute'}
+          </p>
+          <ul>
+            {l.pages.map((p) => (
+              <li key={p.slug}>
+                {p.pageUrl ? (
+                  <a href={p.pageUrl} target="_blank" rel="noreferrer">
+                    {p.title}
+                  </a>
+                ) : (
+                  p.title
+                )}{' '}
+                · {p.team}
+                {p.created && ' (created)'}
+              </li>
+            ))}
+          </ul>
+        </>
       )}
       {l && l.canEdit === false && (
         <p className="error" role="alert">
@@ -350,18 +384,21 @@ function DemoData() {
         </p>
       )}
       <p className="muted">
-        Adds 30 more <code>export</code> tickets to SUP (once), then evaluates the demo page's confirmed tripwires twice so a
-        crossed threshold trips and opens a Revisit task.
+        Adds 30 more <code>export</code> and 6 <code>billing</code> tickets to SUP (once), confirms the proposed tripwires of the
+        other seven demo pages you can edit, moves dates and check-ins a month on, then evaluates the Jira-count tripwires twice
+        so a crossed threshold trips and opens a Revisit task. The other tripwires are evaluated in the background.
       </p>
       <button type="button" className="setup__button" onClick={runSim} disabled={busy}>
         {sim.busy ? 'Simulating…' : 'Simulate a busy month'}
       </button>
       {s && (
         <p role="status">
-          {s.created} tickets created · now {s.issueCount} in SUP
+          {s.created} tickets created · now {s.issueCount} export and {s.billingIssueCount} billing tickets in SUP
+          {s.confirmed > 0 && ` · ${s.confirmed} demo tripwires confirmed`}
           {!s.indexed && ' · Jira search is still catching up, nothing evaluated yet'}
           {s.passes.map((p, i) => ` · pass ${i + 1}: ${p.evaluated} evaluated, ${p.errors} errors${p.rateLimited ? ', rate limited' : ''}`)}
           {s.revisits.length > 0 ? ` · Revisit: ${s.revisits.map((r) => r.issueKey).join(', ')}` : ' · no Revisit opened'}
+          {s.queued > 0 && ` · ${s.queued} date/check-in/page tripwires queued (their Revisit tasks follow within a minute)`}
           {!s.complete && ' · not finished: click again to evaluate (no new tickets are created)'}
         </p>
       )}

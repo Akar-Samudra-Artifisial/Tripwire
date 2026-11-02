@@ -86,6 +86,19 @@ export const confluence = {
     return { title: page.title, webUrl: links?.base && links.webui ? `${links.base}${links.webui}` : undefined };
   },
 
+  /**
+   * Whether the current user may administer the space (v2 space operations, as the user). False on 401/403/404;
+   * other failures throw (callers fail closed).
+   */
+  async canAdministerSpace(spaceId: string): Promise<boolean> {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/spaces/${spaceId}/operations`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (res.status === 401 || res.status === 403 || res.status === 404) return false;
+    const body = await readJson<{ operations?: { operation?: string; targetType?: string }[] }>(res, `get operations of space ${spaceId}`);
+    return (body.operations ?? []).some((o) => o.operation === 'administer' && o.targetType === 'space');
+  },
+
   /** The space with this key, or undefined. */
   async findSpace(key: string): Promise<{ id: string; key: string } | undefined> {
     const res = await api.asApp().requestConfluence(route`/wiki/api/v2/spaces?keys=${key}&limit=1`, {
