@@ -1,7 +1,7 @@
 import { isForgePlatformError } from '@forge/api';
 import Resolver from '@forge/resolver';
 import { confluence } from '../adapters/confluence';
-import { jira } from '../adapters/jira';
+import { jira, JiraUnavailableError } from '../adapters/jira';
 import { sqlRepo, type DecisionRow, type EvaluationRow, type RevisitRow, type TripwirePatch, type TripwireRow } from '../adapters/repo';
 import { loadDemoData, resetDemo, SeedError, simulateBusyMonth, type SeedDeps } from '../adapters/seed';
 import { ensureSchema, listAppliedMigrations } from '../adapters/sql';
@@ -13,19 +13,26 @@ import { normaliseSettings, SettingsError, type Settings } from '../core/setting
 import { EVALUABLE_STATUSES } from '../core/state';
 import { validateSpec } from '../core/triggers';
 import type { Assumption, JqlThresholdSpec } from '../core/types';
-import { enqueueExtraction, enqueueLlmProbe, evalDeps } from './background';
+import { asUserGraph, cloudIdFromInstallContext, fetchPairGraph } from '../adapters/teamworkGraph';
+import { enqueueEvaluation, enqueueExtraction, enqueueLlmProbe, enqueueRadarScan, evalDeps, RADAR_LAST_SCAN_KEY } from './background';
+import { radarGraphContextWith, radarListWith, RadarNotFoundError, type RadarViewDeps } from './radar';
 
 const resolver = new Resolver();
 
-type ResolverContext = {
+export type ResolverContext = {
   accountId?: string;
   moduleKey?: string;
+  cloudId?: string;
+  installContext?: string;
   extension?: { content?: { id?: string | number }; issue?: { key?: string } };
 };
 
 const SETUP_MODULE = 'tripwire-setup';
 const BYLINE_MODULE = 'tripwire-byline';
 const REVISIT_MODULE = 'tripwire-revisit';
+const HEALTH_MODULE = 'tripwire-health';
+
+const MODULE_NAMES: Record<string, string> = { [SETUP_MODULE]: 'Tripwire setup', [HEALTH_MODULE]: 'Decision Health' };
 
 /** Placeholder status shown by every Custom UI view until the real queries land. */
 resolver.define('getStatus', ({ context }: { context: ResolverContext }) => ({
@@ -35,12 +42,31 @@ resolver.define('getStatus', ({ context }: { context: ResolverContext }) => ({
   tripped: 0,
 }));
 
-/** Runs `body` only for Jira admins on the setup page; failures become `{ error }` replies for the UI bridge. */
-async function adminOnly<T>(context: unknown, action: string, body: () => Promise<T>): Promise<T | { error: string }> {
+interface AdminCheck {
+  allowed: (accountId: string) => Promise<boolean>;
+  /** Who may do it, for the refusal message. */
+  who: string;
+}
+
+const JIRA_ADMINS: AdminCheck = { allowed: (accountId) => jira.isAdmin(accountId), who: 'Jira administrators' };
+
+/**
+ * Runs `body` only for admins (default: Jira admins) on one of `modules` (default: the setup page); failures
+ * become `{ error }` replies for the UI bridge.
+ */
+async function adminOnly<T>(
+  context: unknown,
+  action: string,
+  body: () => Promise<T>,
+  modules: readonly string[] = [SETUP_MODULE],
+  check: AdminCheck = JIRA_ADMINS,
+): Promise<T | { error: string }> {
   const ctx = context as ResolverContext;
-  if (ctx.moduleKey !== SETUP_MODULE || !ctx.accountId) return { error: `${action} is only available on Tripwire setup.` };
+  if (!ctx.moduleKey || !modules.includes(ctx.moduleKey) || !ctx.accountId) {
+    return { error: `${action} is only available on ${modules.map((m) => MODULE_NAMES[m] ?? m).join(' or ')}.` };
+  }
   try {
-    if (!(await jira.isAdmin(ctx.accountId))) return { error: `Only Jira administrators can ${action.toLowerCase()}.` };
+    if (!(await check.allowed(ctx.accountId))) return { error: `Only ${check.who} can ${action.toLowerCase()}.` };
     return await body();
   } catch (err) {
     if (err instanceof SettingsError || err instanceof SeedError) return { error: err.message };
@@ -106,6 +132,7 @@ const seedDeps: SeedDeps = {
   confluence,
   repo: sqlRepo,
   enqueueExtraction,
+  enqueueEvaluation,
   evaluate: async (ids) => {
     try {
       return { results: await evaluateMany(ids, evalDeps), rateLimited: false };
@@ -122,7 +149,7 @@ resolver.define('loadDemoData', ({ context }) =>
   adminOnly(context, 'Load demo data', async () => {
     await ensureSchema();
     const result = await loadDemoData((context as ResolverContext).accountId as string, seedDeps);
-    console.info('tripwire loadDemoData', { pageId: result.pageId, issueCount: result.issueCount, created: result.created });
+    console.info('tripwire loadDemoData', { pageId: result.pageId, issueCount: result.issueCount, billingIssueCount: result.billingIssueCount, pages: result.pages.length, extractionsQueued: result.extractionsQueued, complete: result.complete, created: result.created });
     return result;
   }),
 );
@@ -130,8 +157,8 @@ resolver.define('loadDemoData', ({ context }) =>
 resolver.define('simulateBusyMonth', ({ context }) =>
   adminOnly(context, 'Simulate a busy month', async () => {
     await ensureSchema();
-    const result = await simulateBusyMonth(seedDeps);
-    console.info('tripwire simulateBusyMonth', { created: result.created, issueCount: result.issueCount, indexed: result.indexed, complete: result.complete, passes: result.passes, revisits: result.revisits.length });
+    const result = await simulateBusyMonth(seedDeps, (context as ResolverContext).accountId as string);
+    console.info('tripwire simulateBusyMonth', { created: result.created, issueCount: result.issueCount, billingIssueCount: result.billingIssueCount, indexed: result.indexed, complete: result.complete, passes: result.passes, revisits: result.revisits.length, confirmed: result.confirmed, queued: result.queued });
     return result;
   }),
 );
@@ -140,9 +167,120 @@ resolver.define('resetDemo', ({ context }) =>
   adminOnly(context, 'Reset demo', async () => {
     await ensureSchema();
     const result = await resetDemo((context as ResolverContext).accountId as string, seedDeps);
-    console.info('tripwire resetDemo', { ...result, warnings: result.warnings.length });
+    console.info('tripwire resetDemo', { ...result, revisitIssueKeys: result.revisitIssueKeys.length, warnings: result.warnings.length });
     return result;
   }),
+);
+
+// --- Decision Health → Radar -----------------------------------------------------------------------
+
+/** Minimum seconds between two "Scan now" requests. */
+export const RADAR_SCAN_COOLDOWN_SECONDS = 60;
+const RADAR_REQUEST_LOCK = 'radar-scan-request';
+
+const radarViewDeps = (): RadarViewDeps => ({
+  repo: sqlRepo,
+  viewPage: (pageId) => confluence.viewPageAsUser(pageId),
+  isPlatformError: (err) => err instanceof Error && isForgePlatformError(err),
+  now: () => new Date(),
+});
+
+/**
+ * Radar managers (dismiss, scan now): Jira admins. Jira is optional, so when it cannot be reached as the app (not
+ * installed, or the call is refused) the check falls back to Confluence: a user who may administer one of the
+ * watched spaces. Fails closed: any error in the fallback means "no".
+ */
+export async function canManageRadar(accountId: string): Promise<boolean> {
+  try {
+    return await jira.isAdmin(accountId);
+  } catch (err) {
+    if (!(err instanceof JiraUnavailableError)) throw err;
+    console.info('tripwire radar: Jira unavailable, checking Confluence space admin', { error: err.message.slice(0, 200) });
+  }
+  try {
+    await ensureSchema();
+    const { watchedSpaceKeys } = await sqlRepo.getSettings();
+    for (const key of watchedSpaceKeys.slice(0, 10)) {
+      const space = await confluence.findSpace(key);
+      if (space && (await confluence.canAdministerSpace(space.id))) return true;
+    }
+    return false;
+  } catch (err) {
+    console.warn('tripwire radar: Confluence space admin check failed', { error: err instanceof Error ? err.message : String(err) });
+    return false;
+  }
+}
+
+const RADAR_MANAGERS: AdminCheck = { allowed: canManageRadar, who: 'Jira administrators (or, without Jira, admins of a watched space)' };
+
+/** Site id of the invocation: `cloudId`, else parsed from `installContext`. */
+export function siteIdOf(ctx: ResolverContext): string | undefined {
+  return ctx.cloudId || cloudIdFromInstallContext(ctx.installContext);
+}
+
+/** Runs `body` for anyone on Decision Health; platform errors (e.g. missing consent) are rethrown for the bridge. */
+async function onHealth<T>(context: unknown, action: string, body: (ctx: ResolverContext & { accountId: string }) => Promise<T>): Promise<T | { error: string }> {
+  const ctx = context as ResolverContext;
+  if (ctx.moduleKey !== HEALTH_MODULE || !ctx.accountId) return { error: `${action} is only available on Decision Health.` };
+  try {
+    await ensureSchema();
+    return await body({ ...ctx, accountId: ctx.accountId });
+  } catch (err) {
+    if (err instanceof RadarNotFoundError) return { error: err.message };
+    if (err instanceof Error && isForgePlatformError(err)) throw err;
+    console.error(`Tripwire ${action} failed`, err);
+    return { error: `${action} failed. Check the app logs.` };
+  }
+}
+
+resolver.define('radarList', ({ context }) =>
+  onHealth(context, 'Load Radar', async (ctx) => {
+    const canManage = await canManageRadar(ctx.accountId).catch(() => false);
+    return radarListWith(radarViewDeps(), canManage, RADAR_LAST_SCAN_KEY);
+  }),
+);
+
+resolver.define('radarGraphContext', ({ payload, context }) =>
+  onHealth(context, 'Load graph context', async (ctx) => {
+    const pairId = (payload as { pairId?: unknown } | undefined)?.pairId;
+    if (typeof pairId !== 'string' || pairId === '') return { error: 'pairId is required.' };
+    const cloudId = siteIdOf(ctx);
+    const fetchGraph = cloudId ? (a: string, b: string) => fetchPairGraph(asUserGraph(cloudId), cloudId, a, b) : undefined;
+    return { pair: await radarGraphContextWith(pairId, radarViewDeps(), fetchGraph) };
+  }),
+);
+
+resolver.define('radarDismiss', ({ payload, context }) =>
+  adminOnly(
+    context,
+    'Dismiss Radar pair',
+    async () => {
+      const pairId = (payload as { pairId?: unknown } | undefined)?.pairId;
+      if (typeof pairId !== 'string' || pairId === '') return { error: 'pairId is required.' };
+      await ensureSchema();
+      if (!(await sqlRepo.setRadarPairStatus(pairId, ['open'], 'dismissed'))) return { error: 'This Radar pair is no longer open.' };
+      console.info('tripwire radar dismiss', { pairId });
+      return { dismissed: pairId };
+    },
+    [HEALTH_MODULE],
+    RADAR_MANAGERS,
+  ),
+);
+
+resolver.define('radarScanNow', ({ context }) =>
+  adminOnly(
+    context,
+    'Scan for contradictions',
+    async () => {
+      await ensureSchema();
+      if (!(await sqlRepo.acquireAppLock(RADAR_REQUEST_LOCK, new Date().toISOString(), RADAR_SCAN_COOLDOWN_SECONDS))) {
+        return { error: `A scan was requested less than ${RADAR_SCAN_COOLDOWN_SECONDS} seconds ago. Try again in a minute.` };
+      }
+      return { jobId: await enqueueRadarScan('manual') };
+    },
+    [HEALTH_MODULE],
+    RADAR_MANAGERS,
+  ),
 );
 
 // --- Confluence byline -----------------------------------------------------------------------------

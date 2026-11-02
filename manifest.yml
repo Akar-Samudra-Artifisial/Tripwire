@@ -57,6 +57,9 @@ modules:
     - key: evaluate-consumer
       queue: evaluate
       function: evaluate-batch
+    - key: radar-consumer
+      queue: radar-scan
+      function: radar-scan
 
   # --- Rovo ---
   rovo:agent:
@@ -115,6 +118,9 @@ modules:
       timeoutSeconds: 900
     - key: list-tripped-fn
       handler: index.listTripped
+    - key: radar-scan
+      handler: index.radarScan
+      timeoutSeconds: 900
 
 resources:
   - key: byline-ui
@@ -149,3 +155,4 @@ permissions:
     - read:graph:project:jira
     - read:graph:user:atlassian
     - read:graph:page:confluence
+    - read:graph:team:atlassian   # Radar: teams of page contributors (cross-team severity)

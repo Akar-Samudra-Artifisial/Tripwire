@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { DecisionRow, EvaluationRow, PageLock, Repo, RevisitRow, TripwireRow } from '../../src/adapters/repo';
 import { DEFAULT_SETTINGS, type Settings } from '../../src/core/settings';
-import type { Assumption, Relation } from '../../src/core/types';
+import type { RadarPairRow, RadarPairView } from '../../src/core/radar';
+import type { Assumption, Relation, TripwireStatus } from '../../src/core/types';
 
 /** In-memory `Repo` with the same semantics as `sqlRepo` (unique page per decision, CAS on status). */
 export interface FakeRepo extends Repo {
@@ -19,9 +20,14 @@ export interface FakeRepo extends Repo {
   /** App lock name → ISO time the lock ends. */
   appLocks: Map<string, string>;
   appValues: Map<string, unknown>;
+  /** Radar pairs by id (unique on decisionAId + decisionBId, like `uq_radar_pairs_pair`). */
+  radarPairs: Map<string, FakeRadarPair>;
 }
 
 const clone = <T>(v: T): T => structuredClone(v);
+
+/** Stored pair plus the failure columns (`failed_hash`, `attempts`). */
+export type FakeRadarPair = RadarPairRow & { failedHash?: string | null; attempts?: number };
 
 export function fakeRepo(): FakeRepo {
   const repo: FakeRepo = {
@@ -36,6 +42,7 @@ export function fakeRepo(): FakeRepo {
     versions: new Map(),
     appLocks: new Map(),
     appValues: new Map(),
+    radarPairs: new Map(),
 
     async getSettings() {
       return clone(repo.settings);
@@ -199,6 +206,9 @@ export function fakeRepo(): FakeRepo {
       for (const id of tripwireIds) repo.tripwires.delete(id);
       for (const r of revisitIds) repo.revisits.delete(r.id);
       for (const id of assumptionIds) repo.assumptions.delete(id);
+      for (const p of [...repo.radarPairs.values()]) {
+        if (p.decisionAId === decisionId || p.decisionBId === decisionId) repo.radarPairs.delete(p.id);
+      }
       const page = repo.decisions.get(decisionId)?.pageId;
       repo.decisions.delete(decisionId);
       if (page) repo.pageLocks.delete(page);
@@ -223,6 +233,8 @@ export function fakeRepo(): FakeRepo {
       if (locks) repo.pageLocks.set(pageId, { ...locks, [lock]: undefined });
     },
     async acquireAppLock(name, nowIso, seconds) {
+      // Same key rule as `appKey` in sqlRepo, so an invalid lock name fails in tests too.
+      if (!/^[a-z][a-z0-9-]{0,63}$/.test(name) || name === 'app') throw new Error(`Invalid app key: ${name}`);
       const until = repo.appLocks.get(name);
       if (until !== undefined && Date.parse(until) > Date.parse(nowIso)) return false;
       repo.appLocks.set(name, new Date(Date.parse(nowIso) + seconds * 1000).toISOString());
@@ -237,6 +249,119 @@ export function fakeRepo(): FakeRepo {
     async setAppValue(key, value) {
       repo.appValues.set(key, clone(value));
     },
+
+    async countTripwiresByStatus() {
+      const out: Partial<Record<TripwireStatus, number>> = {};
+      for (const t of repo.tripwires.values()) out[t.status] = (out[t.status] ?? 0) + 1;
+      return out;
+    },
+    async listRadarDecisions(limit) {
+      return [...repo.decisions.values()]
+        .filter((d) => d.status === 'active' && d.extractedAt && !d.extractError && d.statement !== '')
+        .sort((a, b) => (b.extractedAt ?? '').localeCompare(a.extractedAt ?? '') || a.id.localeCompare(b.id))
+        .slice(0, limit)
+        .map(clone);
+    },
+    async listRadarAssessments() {
+      return [...repo.radarPairs.values()].map(({ decisionAId, decisionBId, hashA, hashB, failedHash, attempts }) => ({
+        decisionAId,
+        decisionBId,
+        hashA,
+        hashB,
+        failedHash: failedHash ?? null,
+        attempts: attempts ?? 0,
+      }));
+    },
+    async upsertRadarPair(p) {
+      if (!(p.decisionAId < p.decisionBId)) throw new Error('radar pair must be ordered decision_a_id < decision_b_id');
+      const now = new Date().toISOString();
+      const existing = [...repo.radarPairs.values()].find((x) => x.decisionAId === p.decisionAId && x.decisionBId === p.decisionBId);
+      if (existing) {
+        repo.radarPairs.set(existing.id, {
+          ...existing,
+          ...clone(p),
+          status: existing.status === 'dismissed' && existing.hashA === p.hashA && existing.hashB === p.hashB ? 'dismissed' : p.status,
+          failedHash: null,
+          attempts: 0,
+          updatedAt: now,
+        });
+        return;
+      }
+      const id = randomUUID();
+      repo.radarPairs.set(id, { ...clone(p), id, graph: null, graphFetchedAt: null, detectedAt: now, updatedAt: now, failedHash: null, attempts: 0 });
+    },
+    async recordRadarFailure(p) {
+      if (!(p.decisionAId < p.decisionBId)) throw new Error('radar pair must be ordered decision_a_id < decision_b_id');
+      const existing = [...repo.radarPairs.values()].find((x) => x.decisionAId === p.decisionAId && x.decisionBId === p.decisionBId);
+      if (existing) {
+        const attempts = existing.failedHash === p.failedHash ? (existing.attempts ?? 0) + 1 : 1;
+        repo.radarPairs.set(existing.id, { ...existing, failedHash: p.failedHash, attempts });
+        return;
+      }
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      repo.radarPairs.set(id, {
+        id,
+        decisionAId: p.decisionAId,
+        decisionBId: p.decisionBId,
+        status: 'pending',
+        confidence: 0,
+        summary: '',
+        sharedTopics: [],
+        graph: null,
+        graphFetchedAt: null,
+        hashA: '',
+        hashB: '',
+        detectedAt: now,
+        updatedAt: now,
+        failedHash: p.failedHash,
+        attempts: 1,
+      });
+    },
+    async listRadarPairs(statuses, limit) {
+      return [...repo.radarPairs.values()]
+        .filter((p) => statuses.includes(p.status))
+        .sort((x, y) => y.confidence - x.confidence || x.id.localeCompare(y.id))
+        .slice(0, limit)
+        .flatMap((p) => radarView(p));
+    },
+    async getRadarPair(id) {
+      const p = repo.radarPairs.get(id);
+      return p ? radarView(p)[0] : undefined;
+    },
+    async updateRadarPairGraph(id, graph, fetchedAt, keepOkSince) {
+      const p = repo.radarPairs.get(id);
+      if (!p) return false;
+      const freshOk = p.graph?.state === 'ok' && p.graphFetchedAt !== null && keepOkSince !== undefined && Date.parse(p.graphFetchedAt) > Date.parse(keepOkSince);
+      if (graph.state !== 'ok' && freshOk) return false;
+      repo.radarPairs.set(id, { ...p, graph: clone(graph), graphFetchedAt: fetchedAt });
+      return true;
+    },
+    async purgeLegacyRadarGraphs() {
+      let n = 0;
+      for (const p of repo.radarPairs.values()) {
+        if (p.graph && 'a' in (p.graph as object)) {
+          repo.radarPairs.set(p.id, { ...p, graph: null, graphFetchedAt: null });
+          n += 1;
+        }
+      }
+      return n;
+    },
+    async setRadarPairStatus(id, from, to) {
+      const p = repo.radarPairs.get(id);
+      if (!p || !from.includes(p.status)) return false;
+      repo.radarPairs.set(id, { ...p, status: to });
+      return true;
+    },
+  };
+
+  /** Inner join with both decisions, like the SQL query. */
+  const radarView = ({ failedHash: _f, attempts: _n, ...p }: FakeRadarPair): RadarPairView[] => {
+    const a = repo.decisions.get(p.decisionAId);
+    const b = repo.decisions.get(p.decisionBId);
+    if (!a || !b) return [];
+    const summary = (d: typeof a) => ({ id: d.id, pageId: d.pageId, title: d.title, statement: d.statement, team: d.team });
+    return [{ pair: clone(p), a: summary(a), b: summary(b) }];
   };
   return repo;
 }

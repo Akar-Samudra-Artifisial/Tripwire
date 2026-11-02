@@ -13,6 +13,7 @@ import type {
   TripwireKind,
   TripwireStatus,
 } from '../core/types';
+import type { PairGraph, RadarAssessment, RadarFailureRow, RadarPairRow, RadarPairView, RadarStatus, RadarVerdictRow } from '../core/radar';
 import { execute, query } from './sql';
 
 export interface DecisionRow extends Decision {
@@ -114,7 +115,7 @@ export interface Repo {
    * `team` (case-insensitive) is applied before `limit`.
    */
   listWatchRows(statuses: readonly TripwireStatus[], limit: number, team?: string): Promise<WatchRow[]>;
-  /** Deletes a decision row and everything hanging off it (assumptions, tripwires, evaluations, revisits, relations). */
+  /** Deletes a decision row and everything hanging off it (assumptions, tripwires, evaluations, revisits, relations, radar pairs). */
   deleteDecisionTree(decisionId: string): Promise<DeletedTree>;
   /**
    * Atomically takes `lock` for the page until now + `seconds` (creating a placeholder decision row if needed).
@@ -128,6 +129,34 @@ export interface Repo {
   /** Small app-wide JSON values stored next to the settings (key must not be the settings key). */
   getAppValue(key: string): Promise<unknown>;
   setAppValue(key: string, value: unknown): Promise<void>;
+  /** Tripwire count per status (Decision Health overview). */
+  countTripwiresByStatus(): Promise<Partial<Record<TripwireStatus, number>>>;
+  /** Extracted, active decisions with a statement, newest extraction first (Radar candidates). */
+  listRadarDecisions(limit: number): Promise<DecisionRow[]>;
+  /** Pairs already assessed (or failed), with the fingerprints their verdict was made on and failure counts. */
+  listRadarAssessments(): Promise<RadarAssessment[]>;
+  /**
+   * Inserts or updates the pair's verdict (unique on decision_a_id, decision_b_id) and clears its failure count.
+   * A `dismissed` pair stays dismissed only while both fingerprints are unchanged; its graph cache is kept.
+   */
+  upsertRadarPair(p: RadarVerdictRow): Promise<void>;
+  /**
+   * Counts one failed classifier attempt: `attempts` + 1 when `failedHash` is the same as last time, else 1. A
+   * pair without a verdict is stored as `pending` (never listed).
+   */
+  recordRadarFailure(p: RadarFailureRow): Promise<void>;
+  /** Pairs in `statuses` with both decisions, most confident first. */
+  listRadarPairs(statuses: readonly RadarStatus[], limit: number): Promise<RadarPairView[]>;
+  getRadarPair(id: string): Promise<RadarPairView | undefined>;
+  /**
+   * Stores the graph cache. With `keepOkSince`, a non-`ok` graph does not replace an `ok` one fetched after that
+   * time (still fresh); returns false when nothing was written.
+   */
+  updateRadarPairGraph(id: string, graph: PairGraph, fetchedAt: string, keepOkSince?: string): Promise<boolean>;
+  /** Clears graph caches written before they held aggregates only (they contained contributor account ids). */
+  purgeLegacyRadarGraphs(): Promise<number>;
+  /** Status CAS; false when the pair is missing or not in `from`. */
+  setRadarPairStatus(id: string, from: readonly RadarStatus[], to: RadarStatus): Promise<boolean>;
 }
 
 // --- Column helpers -------------------------------------------------------------------------------
@@ -250,6 +279,55 @@ function toRevisit(r: Row): RevisitRow {
   };
 }
 
+const RADAR_STATUSES: readonly RadarStatus[] = ['open', 'dismissed', 'resolved', 'pending'];
+
+const RADAR_PAIR_COLS =
+  'p.id, p.decision_a_id, p.decision_b_id, p.status, p.confidence, p.summary, p.shared_topics, p.graph_json, p.graph_fetched_at, p.hash_a, p.hash_b, p.detected_at, p.updated_at, ' +
+  'da.page_id AS a_page_id, da.title AS a_title, da.statement AS a_statement, da.team AS a_team, ' +
+  'db.page_id AS b_page_id, db.title AS b_title, db.statement AS b_statement, db.team AS b_team';
+const RADAR_PAIR_FROM = 'radar_pairs p JOIN decisions da ON da.id = p.decision_a_id JOIN decisions db ON db.id = p.decision_b_id';
+
+/**
+ * Malformed or legacy cached graph JSON (the old shape held contributor account ids) is treated as "not fetched"
+ * so the next view fetches it again.
+ */
+export function parseGraph(raw: unknown): PairGraph | null {
+  if (raw === null || raw === undefined) return null;
+  try {
+    const g = parseJsonColumn<Record<string, unknown> | null>(raw);
+    if (!g) return null;
+    if (g.state === 'unavailable' && typeof g.reason === 'string') return g as PairGraph;
+    if ((g.state === 'ok' || g.state === 'partial') && typeof g.contributorsA === 'number' && Array.isArray(g.teamsA)) return g as PairGraph;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function toRadarPairView(r: Row): RadarPairView {
+  const status = String(r.status) as RadarStatus;
+  const pair: RadarPairRow = {
+    id: String(r.id),
+    decisionAId: String(r.decision_a_id),
+    decisionBId: String(r.decision_b_id),
+    status: RADAR_STATUSES.includes(status) ? status : 'resolved',
+    confidence: Number(r.confidence ?? 0),
+    summary: String(r.summary ?? ''),
+    sharedTopics: parseJsonColumn<string[] | null>(r.shared_topics) ?? [],
+    graph: parseGraph(r.graph_json),
+    graphFetchedAt: fromSqlTs(r.graph_fetched_at),
+    hashA: String(r.hash_a),
+    hashB: String(r.hash_b),
+    detectedAt: fromSqlTs(r.detected_at) ?? '',
+    updatedAt: fromSqlTs(r.updated_at) ?? '',
+  };
+  return {
+    pair,
+    a: { id: pair.decisionAId, pageId: String(r.a_page_id), title: str(r.a_title), statement: String(r.a_statement ?? ''), team: str(r.a_team) },
+    b: { id: pair.decisionBId, pageId: String(r.b_page_id), title: str(r.b_title), statement: String(r.b_statement ?? ''), team: str(r.b_team) },
+  };
+}
+
 /** TripwirePatch field → [column, value encoder]. Keeps `casTripwire` free of string-built values. */
 const PATCH_COLUMNS: { [K in keyof Required<TripwirePatch>]: [string, (v: TripwirePatch[K]) => unknown] } = {
   status: ['status', (v) => v],
@@ -290,7 +368,7 @@ async function insertTripwire(t: TripwireRow): Promise<void> {
 const SETTINGS_KEY = 'app';
 
 /** Validates an app lock/value name (fixed identifiers only; never user input). */
-function appKey(name: string): string {
+export function appKey(name: string): string {
   if (!/^[a-z][a-z0-9-]{0,63}$/.test(name) || name === SETTINGS_KEY) throw new Error(`Invalid app key: ${name}`);
   return name;
 }
@@ -567,6 +645,7 @@ export const sqlRepo: Repo = {
     const tripwires =
       tripwireIds.length > 0 ? await execute(`DELETE FROM tripwires WHERE id IN (${placeholders(tripwireIds.length)})`, ...tripwireIds) : 0;
     const revisits = await execute('DELETE FROM revisits WHERE decision_id = ?', decisionId);
+    await execute('DELETE FROM radar_pairs WHERE decision_a_id = ? OR decision_b_id = ?', decisionId, decisionId);
     const assumptions = await execute('DELETE FROM assumptions WHERE decision_id = ?', decisionId);
     await execute('DELETE FROM decisions WHERE id = ?', decisionId);
     return { tripwires, assumptions, evaluations, revisits };
@@ -618,5 +697,105 @@ export const sqlRepo: Repo = {
 
   async setAppValue(key, value) {
     await execute('INSERT INTO settings (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)', appKey(key), JSON.stringify(value));
+  },
+
+  async countTripwiresByStatus() {
+    const rows = await query<Row>('SELECT status, COUNT(*) AS n FROM tripwires GROUP BY status');
+    return Object.fromEntries(rows.map((r) => [String(r.status), Number(r.n ?? 0)])) as Partial<Record<TripwireStatus, number>>;
+  },
+
+  async listRadarDecisions(limit) {
+    const rows = await query<Row>(
+      `SELECT ${DECISION_COLS} FROM decisions
+       WHERE status = 'active' AND extracted_at IS NOT NULL AND extract_error IS NULL AND statement <> ''
+       ORDER BY extracted_at DESC, id LIMIT ${sqlInt(limit, 0, 1_000)}`,
+    );
+    return rows.map(toDecision);
+  },
+
+  async listRadarAssessments() {
+    const rows = await query<Row>('SELECT decision_a_id, decision_b_id, hash_a, hash_b, failed_hash, attempts FROM radar_pairs LIMIT 20000');
+    return rows.map((r) => ({
+      decisionAId: String(r.decision_a_id),
+      decisionBId: String(r.decision_b_id),
+      hashA: String(r.hash_a),
+      hashB: String(r.hash_b),
+      failedHash: str(r.failed_hash) ?? null,
+      attempts: Number(r.attempts ?? 0),
+    }));
+  },
+
+  async upsertRadarPair(p) {
+    if (!(p.decisionAId < p.decisionBId)) throw new Error('radar pair must be ordered decision_a_id < decision_b_id');
+    await execute(
+      `INSERT INTO radar_pairs (id, decision_a_id, decision_b_id, status, confidence, summary, shared_topics, hash_a, hash_b)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         status = IF(status = 'dismissed' AND hash_a = VALUES(hash_a) AND hash_b = VALUES(hash_b), 'dismissed', VALUES(status)),
+         confidence = VALUES(confidence), summary = VALUES(summary), shared_topics = VALUES(shared_topics),
+         hash_a = VALUES(hash_a), hash_b = VALUES(hash_b), failed_hash = NULL, attempts = 0`,
+      randomUUID(),
+      p.decisionAId,
+      p.decisionBId,
+      p.status,
+      p.confidence,
+      p.summary,
+      JSON.stringify(p.sharedTopics),
+      p.hashA,
+      p.hashB,
+    );
+  },
+
+  async recordRadarFailure(p) {
+    if (!(p.decisionAId < p.decisionBId)) throw new Error('radar pair must be ordered decision_a_id < decision_b_id');
+    await execute(
+      `INSERT INTO radar_pairs (id, decision_a_id, decision_b_id, status, hash_a, hash_b, failed_hash, attempts)
+       VALUES (?, ?, ?, 'pending', '', '', ?, 1)
+       ON DUPLICATE KEY UPDATE attempts = IF(failed_hash = VALUES(failed_hash), attempts + 1, 1), failed_hash = VALUES(failed_hash)`,
+      randomUUID(),
+      p.decisionAId,
+      p.decisionBId,
+      p.failedHash,
+    );
+  },
+
+  async listRadarPairs(statuses, limit) {
+    if (statuses.length === 0) return [];
+    const rows = await query<Row>(
+      `SELECT ${RADAR_PAIR_COLS} FROM ${RADAR_PAIR_FROM} WHERE p.status IN (${placeholders(statuses.length)})
+       ORDER BY p.confidence DESC, p.id LIMIT ${sqlInt(limit, 0, 500)}`,
+      ...statuses,
+    );
+    return rows.map(toRadarPairView);
+  },
+
+  async getRadarPair(id) {
+    const rows = await query<Row>(`SELECT ${RADAR_PAIR_COLS} FROM ${RADAR_PAIR_FROM} WHERE p.id = ?`, id);
+    return rows[0] ? toRadarPairView(rows[0]) : undefined;
+  },
+
+  async updateRadarPairGraph(id, graph, fetchedAt, keepOkSince) {
+    if (graph.state !== 'ok' && keepOkSince) {
+      const affected = await execute(
+        `UPDATE radar_pairs SET graph_json = ?, graph_fetched_at = ? WHERE id = ?
+         AND NOT (COALESCE(JSON_UNQUOTE(JSON_EXTRACT(graph_json, '$.state')), '') = 'ok' AND graph_fetched_at IS NOT NULL AND graph_fetched_at > ?)`,
+        JSON.stringify(graph),
+        toSqlTs(fetchedAt),
+        id,
+        toSqlTs(keepOkSince),
+      );
+      return affected === 1;
+    }
+    return (await execute('UPDATE radar_pairs SET graph_json = ?, graph_fetched_at = ? WHERE id = ?', JSON.stringify(graph), toSqlTs(fetchedAt), id)) === 1;
+  },
+
+  async purgeLegacyRadarGraphs() {
+    return execute(`UPDATE radar_pairs SET graph_json = NULL, graph_fetched_at = NULL WHERE JSON_EXTRACT(graph_json, '$.a') IS NOT NULL`);
+  },
+
+  async setRadarPairStatus(id, from, to) {
+    if (from.length === 0) return false;
+    const affected = await execute(`UPDATE radar_pairs SET status = ? WHERE id = ? AND status IN (${placeholders(from.length)})`, to, id, ...from);
+    return affected === 1;
   },
 };

@@ -5,18 +5,33 @@ import { sqlRepo, type Repo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { BATCH_SIZE, chunk, EvaluationRateLimitedError, evaluateMany, summarise, type EvalDeps } from '../core/evaluator';
 import { extractPage, type ExtractDeps } from '../core/extractPipeline';
+import { runRadarScan, type RadarScanDeps, type RadarScanResult } from '../core/radar';
 import { openRevisit } from '../core/revisit';
 import { EVALUABLE_STATUSES } from '../core/state';
 import { checkin, contentChange, date, jqlThreshold } from '../core/triggers';
 import type { ContentChangeSpec } from '../core/types';
 import { chatTool, isLlmRateLimited } from '../llm';
 import { repairAssumption, runExtraction } from '../llm/extract';
+import { classifyPair } from '../llm/radar';
 
 export const EXTRACT_QUEUE = 'extract';
 export const EVALUATE_QUEUE = 'evaluate';
+export const RADAR_QUEUE = 'radar-scan';
 
 const extractQueue = new Queue({ key: EXTRACT_QUEUE });
 const evaluateQueue = new Queue({ key: EVALUATE_QUEUE });
+const radarQueue = new Queue({ key: RADAR_QUEUE });
+
+/**
+ * App lock held by one Radar scan at a time. It outlives the consumer timeout (900 s in manifest.yml), so a second
+ * scan cannot start while a slow one is still running; a crashed scan frees it when it expires.
+ */
+export const RADAR_LOCK = 'radar-scan';
+export const RADAR_LOCK_SECONDS = 20 * 60;
+/** Delay after an extraction, so a burst of extractions (e.g. a demo load) ends in one scan. */
+const RADAR_AFTER_EXTRACT_SECONDS = 30;
+/** App value with the outcome of the last scan (shown on the Radar tab). */
+export const RADAR_LAST_SCAN_KEY = 'radar-last-scan';
 
 /** Max tripwires the daily run schedules; Queue.push accepts at most 50 events per call. */
 const MAX_SCHEDULED = 1000;
@@ -96,6 +111,11 @@ export async function onPageEvent(event: PageEvent): Promise<void> {
   await enqueueExtraction(pageId, false);
 }
 
+/** Queues evaluation of these tripwires in batches of `BATCH_SIZE` (used by the demo's "Simulate a busy month"). */
+export async function enqueueEvaluation(ids: readonly string[]): Promise<void> {
+  if (ids.length > 0) await pushBatches(ids);
+}
+
 /** Queues extraction for one page; `requestedBy` (the Scan button user) becomes the decision owner. */
 export async function enqueueExtraction(pageId: string, force: boolean, requestedBy?: string): Promise<string> {
   const { jobId } = await extractQueue.push({ body: { pageId, force, ...(requestedBy ? { requestedBy } : {}) } });
@@ -111,9 +131,10 @@ async function pushBatches(ids: readonly string[], delayInSeconds?: number, atte
   return events.length;
 }
 
-/** Daily: apply pending migrations, then fan out evaluation batches of `BATCH_SIZE` tripwires. */
+/** Daily: apply pending migrations, queue a Radar scan, then fan out evaluation batches of `BATCH_SIZE` tripwires. */
 export async function scheduleEvaluation(): Promise<void> {
   await ensureSchema();
+  await scheduleRadarScan();
   const ids: string[] = [];
   for (let offset = 0; offset < MAX_SCHEDULED; offset += 500) {
     const page = await sqlRepo.listTripwireIdsForEvaluation(EVALUABLE_STATUSES, 500, offset);
@@ -126,6 +147,60 @@ export async function scheduleEvaluation(): Promise<void> {
   }
   const batches = await pushBatches(ids);
   console.info('tripwire scheduleEvaluation', { tripwires: ids.length, batches });
+}
+
+/** Daily: one Radar scan (new or changed decision pairs only). */
+export async function scheduleRadarScan(): Promise<void> {
+  try {
+    await enqueueRadarScan('daily');
+  } catch (err) {
+    console.warn('tripwire radar: daily scan not queued', { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+/** Queues one Radar scan; the consumer makes at most `MAX_CLASSIFY_PER_SCAN` LLM calls. */
+export async function enqueueRadarScan(reason: 'daily' | 'extract' | 'manual', delayInSeconds?: number): Promise<string> {
+  const { jobId } = await radarQueue.push({ body: { reason }, ...(delayInSeconds ? { delayInSeconds } : {}) });
+  return jobId;
+}
+
+export interface RadarConsumerDeps {
+  repo: Repo;
+  classify: RadarScanDeps['classify'];
+  now: () => Date;
+}
+
+/**
+ * Runs one scan under the `radar-scan` app lock. Returns `retry` when another scan holds the lock or the LLM is
+ * rate limited (the queue redelivers the event later).
+ */
+export async function radarScanWith(deps: RadarConsumerDeps): Promise<{ status: 'done' | 'locked' | 'rate_limited'; result?: RadarScanResult }> {
+  const { repo } = deps;
+  if (!(await repo.acquireAppLock(RADAR_LOCK, deps.now().toISOString(), RADAR_LOCK_SECONDS))) return { status: 'locked' };
+  try {
+    // Graph caches from before aggregates-only held contributor account ids; clear them (a no-op once done).
+    const purged = await repo.purgeLegacyRadarGraphs().catch((err: unknown) => {
+      console.warn('tripwire radar: legacy graph purge failed', { error: err instanceof Error ? err.message : String(err) });
+      return 0;
+    });
+    if (purged > 0) console.info('tripwire radar: legacy graph caches cleared', { purged });
+    const result = await runRadarScan({ repo, classify: deps.classify, isRateLimited: isLlmRateLimited });
+    await repo.setAppValue(RADAR_LAST_SCAN_KEY, { at: deps.now().toISOString(), ...result });
+    console.info('tripwire radar scan', result);
+    return { status: result.rateLimited ? 'rate_limited' : 'done', result };
+  } finally {
+    await repo.releaseAppLock(RADAR_LOCK).catch((err: unknown) => {
+      console.warn('tripwire radar: lock release failed', { error: err instanceof Error ? err.message : String(err) });
+    });
+  }
+}
+
+/** Consumer for the `radar-scan` queue. */
+export async function radarScan(): Promise<InvocationError | void> {
+  await ensureSchema();
+  const outcome = await radarScanWith({ repo: sqlRepo, classify: (a, b) => classifyPair(a, b), now });
+  if (outcome.status === 'locked') return retryLater(60, 'locked');
+  if (outcome.status === 'rate_limited') return retryLater(RATE_LIMIT_DELAY_SECONDS);
 }
 
 interface QueueEvent {
@@ -183,6 +258,12 @@ export async function extractDecision(event: QueueEvent): Promise<InvocationErro
   try {
     const result = await extractPage({ pageId, force, requestedBy }, extractDeps);
     console.info('tripwire extract', { pageId, force, ...result });
+    if (result.status === 'done') {
+      // A new or changed decision may contradict another one; failing to queue must not fail the extraction.
+      await enqueueRadarScan('extract', RADAR_AFTER_EXTRACT_SECONDS).catch((err: unknown) => {
+        console.warn('tripwire radar: scan after extraction not queued', { pageId, error: err instanceof Error ? err.message : String(err) });
+      });
+    }
     // Another extraction of this page is running; run again afterwards so this request is not lost.
     if (result.status === 'skipped' && result.reason === 'locked') return retryLater(EXTRACT_LOCKED_RETRY_SECONDS, 'locked');
   } catch (err) {

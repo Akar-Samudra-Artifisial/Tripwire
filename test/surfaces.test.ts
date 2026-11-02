@@ -8,6 +8,10 @@ const forge = vi.hoisted(() => ({
   canEditPage: vi.fn<(pageId: string) => Promise<boolean>>(),
   viewPageAsUser: vi.fn<(pageId: string) => Promise<{ title: string; webUrl?: string } | undefined>>(),
   evaluateMany: vi.fn(),
+  isAdmin: vi.fn<(accountId: string) => Promise<boolean>>(),
+  fetchPairGraph: vi.fn(),
+  findSpace: vi.fn<(key: string) => Promise<{ id: string; key: string } | undefined>>(),
+  canAdministerSpace: vi.fn<(spaceId: string) => Promise<boolean>>(),
   repo: { current: undefined as unknown },
 }));
 
@@ -43,7 +47,23 @@ vi.mock('../src/adapters/sql', () => ({
   execute: vi.fn(),
 }));
 vi.mock('../src/adapters/confluence', () => ({
-  confluence: { canEditPage: forge.canEditPage, getPage: vi.fn(), viewPageAsUser: forge.viewPageAsUser, getPageLabels: async () => [] },
+  confluence: {
+    canEditPage: forge.canEditPage,
+    getPage: vi.fn(),
+    viewPageAsUser: forge.viewPageAsUser,
+    getPageLabels: async () => [],
+    findSpace: forge.findSpace,
+    canAdministerSpace: forge.canAdministerSpace,
+  },
+}));
+vi.mock('../src/adapters/jira', async (importActual) => {
+  const actual = await importActual<typeof import('../src/adapters/jira')>();
+  return { ...actual, jira: { ...actual.jira, isAdmin: forge.isAdmin } };
+});
+vi.mock('../src/adapters/teamworkGraph', async (importActual) => ({
+  ...(await importActual<typeof import('../src/adapters/teamworkGraph')>()),
+  asUserGraph: () => vi.fn(),
+  fetchPairGraph: forge.fetchPairGraph,
 }));
 vi.mock('../src/adapters/repo', async (importActual) => ({
   ...(await importActual<typeof import('../src/adapters/repo')>()),
@@ -83,6 +103,10 @@ beforeEach(() => {
   forge.canEditPage.mockReset().mockResolvedValue(true);
   forge.viewPageAsUser.mockReset().mockResolvedValue({ title: 'Defer CSV export', webUrl: 'https://site/wiki/pages/1' });
   forge.evaluateMany.mockReset();
+  forge.isAdmin.mockReset().mockResolvedValue(true);
+  forge.fetchPairGraph.mockReset().mockResolvedValue({ state: 'unavailable', reason: 'not_indexed' });
+  forge.findSpace.mockReset().mockImplementation(async (key) => ({ id: `id-${key}`, key }));
+  forge.canAdministerSpace.mockReset().mockResolvedValue(false);
 });
 
 describe('onPageEvent: content_change', () => {
@@ -283,5 +307,92 @@ describe('getRevisit resolver (W1)', () => {
     await withRevisit();
     forge.viewPageAsUser.mockRejectedValue(Object.assign(new Error('needs auth'), { name: 'NeedsAuthenticationError' }));
     await expect(panel()).rejects.toThrow('needs auth');
+  });
+});
+
+describe('Radar resolvers', () => {
+  const health = (name: string, payload?: unknown, ctx: Record<string, unknown> = {}) => {
+    const fn = forge.defs.get(name);
+    if (!fn) throw new Error(`resolver ${name} not defined`);
+    return fn({ payload, context: { moduleKey: 'tripwire-health', accountId: 'user-1', cloudId: 'cloud-1', ...ctx } }) as Promise<Record<string, unknown>>;
+  };
+
+  const openPair = async () => {
+    const a = seedTripwire(repo);
+    const b = seedTripwire(repo);
+    const [x, y] = [a.decisionId, b.decisionId].sort();
+    await repo.upsertRadarPair({ decisionAId: x!, decisionBId: y!, hashA: '1', hashB: '2', status: 'open', confidence: 0.9, summary: 'conflict', sharedTopics: ['CSV export'] });
+    return [...repo.radarPairs.keys()][0]!;
+  };
+
+  it('radarDismiss and radarScanNow are for Jira admins only', async () => {
+    const pairId = await openPair();
+    forge.isAdmin.mockResolvedValue(false);
+    forge.canAdministerSpace.mockResolvedValue(true);
+    repo.settings = { ...repo.settings, watchedSpaceKeys: ['ENG'] };
+    const refused = 'Only Jira administrators (or, without Jira, admins of a watched space) can';
+    expect(await health('radarDismiss', { pairId })).toEqual({ error: `${refused} dismiss radar pair.` });
+    expect(await health('radarScanNow')).toEqual({ error: `${refused} scan for contradictions.` });
+    expect(repo.radarPairs.get(pairId)?.status).toBe('open');
+    expect(forge.push).not.toHaveBeenCalled();
+    // Jira answered "not admin": the Confluence fallback is not consulted.
+    expect(forge.canAdministerSpace).not.toHaveBeenCalled();
+  });
+
+  it('without Jira, an admin of a watched space may manage the Radar (fail closed otherwise)', async () => {
+    const { JiraUnavailableError } = await import('../src/adapters/jira');
+    const pairId = await openPair();
+    forge.isAdmin.mockRejectedValue(new JiraUnavailableError('Jira request failed: not installed'));
+    repo.settings = { ...repo.settings, watchedSpaceKeys: ['ENG', 'OPS'] };
+    expect(await health('radarList')).toMatchObject({ canManage: false });
+    expect(await health('radarDismiss', { pairId })).toMatchObject({ error: expect.stringContaining('admins of a watched space') });
+    forge.canAdministerSpace.mockImplementation(async (id) => id === 'id-OPS');
+    expect(await health('radarList')).toMatchObject({ canManage: true });
+    expect(await health('radarDismiss', { pairId })).toEqual({ dismissed: pairId });
+    forge.canAdministerSpace.mockRejectedValue(new Error('HTTP 500'));
+    expect(await health('radarList')).toMatchObject({ canManage: false });
+  });
+
+  it('radarDismiss and radarScanNow are refused outside Decision Health', async () => {
+    const pairId = await openPair();
+    expect(await health('radarDismiss', { pairId }, { moduleKey: 'tripwire-byline' })).toEqual({ error: 'Dismiss Radar pair is only available on Decision Health.' });
+    expect(await health('radarScanNow', undefined, { moduleKey: 'tripwire-setup' })).toMatchObject({ error: expect.stringContaining('only available on Decision Health') });
+    expect(forge.isAdmin).not.toHaveBeenCalled();
+  });
+
+  it('an admin dismisses an open pair once', async () => {
+    const pairId = await openPair();
+    expect(await health('radarDismiss', { pairId })).toEqual({ dismissed: pairId });
+    expect(repo.radarPairs.get(pairId)?.status).toBe('dismissed');
+    expect(await health('radarDismiss', { pairId })).toEqual({ error: 'This Radar pair is no longer open.' });
+  });
+
+  it('an admin queues a scan, at most once a minute', async () => {
+    expect(await health('radarScanNow')).toEqual({ jobId: 'job-1' });
+    expect(forge.push).toHaveBeenCalledWith({ body: { reason: 'manual' } });
+    expect(await health('radarScanNow')).toMatchObject({ error: expect.stringContaining('less than 60 seconds ago') });
+  });
+
+  it('radarList is open to everyone but only shows pairs the user can view', async () => {
+    await openPair();
+    forge.isAdmin.mockResolvedValue(false);
+    expect(await health('radarList')).toMatchObject({ canManage: false, hidden: 0, pairs: [{ summary: 'conflict', graph: { state: 'pending' } }] });
+    forge.viewPageAsUser.mockResolvedValue(undefined);
+    expect(await health('radarList')).toMatchObject({ pairs: [], hidden: 1 });
+  });
+
+  it('radarGraphContext fetches the graph as the user with the site id and caches it', async () => {
+    const pairId = await openPair();
+    const result = await health('radarGraphContext', { pairId });
+    expect(forge.fetchPairGraph).toHaveBeenCalledWith(expect.any(Function), 'cloud-1', expect.any(String), expect.any(String));
+    expect(result).toMatchObject({ pair: { graph: { state: 'unavailable', reason: 'not_indexed' } } });
+    expect(repo.radarPairs.get(pairId)?.graph).toEqual({ state: 'unavailable', reason: 'not_indexed' });
+  });
+
+  it('radarGraphContext answers "not found" for a pair the user cannot view', async () => {
+    const pairId = await openPair();
+    forge.viewPageAsUser.mockResolvedValue(undefined);
+    expect(await health('radarGraphContext', { pairId })).toEqual({ error: 'This Radar pair no longer exists.' });
+    expect(forge.fetchPairGraph).not.toHaveBeenCalled();
   });
 });

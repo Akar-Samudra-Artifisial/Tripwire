@@ -120,6 +120,32 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       until_at TIMESTAMP NULL
     )`,
   },
+  // Radar: one row per assessed decision pair (decision_a_id < decision_b_id). `hash_a`/`hash_b` are the decision
+  // fingerprints the verdict was made on, so an unchanged pair is never sent to the LLM again.
+  {
+    name: 'v017_create_radar_pairs',
+    statement: `CREATE TABLE IF NOT EXISTS radar_pairs (
+      id VARCHAR(36) PRIMARY KEY,
+      decision_a_id VARCHAR(36) NOT NULL,
+      decision_b_id VARCHAR(36) NOT NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'open',
+      confidence DOUBLE NOT NULL DEFAULT 0,
+      summary TEXT NULL,
+      shared_topics JSON NULL,
+      graph_json JSON NULL,
+      graph_fetched_at TIMESTAMP NULL,
+      hash_a VARCHAR(64) NOT NULL,
+      hash_b VARCHAR(64) NOT NULL,
+      detected_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_radar_pairs_pair (decision_a_id, decision_b_id),
+      KEY idx_radar_pairs_status (status)
+    )`,
+  },
+  // Radar: failed classifier attempts per pair, so a pair that keeps failing is retried a few times, then skipped
+  // until one of its decisions changes (`failed_hash` = fingerprint of the failed version).
+  { name: 'v018a_radar_pairs_failed_hash', statement: 'ALTER TABLE radar_pairs ADD COLUMN IF NOT EXISTS failed_hash VARCHAR(64) NULL' },
+  { name: 'v018b_radar_pairs_attempts', statement: 'ALTER TABLE radar_pairs ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0' },
 ];
 
 /** Name of the newest migration; `initialise` reports it so admins can confirm the schema is current. */
