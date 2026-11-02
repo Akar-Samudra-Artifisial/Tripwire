@@ -17,6 +17,19 @@ export function Shell({ title, children }: { title: string; children: ReactNode 
   );
 }
 
+export function ErrorText({ children }: { children: ReactNode }) {
+  return (
+    <p className="error" role="alert">
+      {children}
+    </p>
+  );
+}
+
+/** Tripwire status pill (proposed, active, near, tripped, revisiting, archived). */
+export function StatusBadge({ status }: { status: string }) {
+  return <span className={`badge badge--${status}`}>{status}</span>;
+}
+
 /** Placeholder body shared by every view until real data lands. */
 export function Placeholder({ description }: { description: string }) {
   const status = useRemote<Status>('getStatus');
