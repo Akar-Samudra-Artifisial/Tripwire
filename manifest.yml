@@ -140,7 +140,6 @@ permissions:
     - write:jira-work
     - manage:jira-project        # Revisit project setup
     - manage:jira-configuration  # admin check, issue types for Revisit tasks
-    - storage:app
     - read:label:confluence      # decision label on pages (v2 API)
     - read:space:confluence      # watched spaces (v2 API)
     - write:page:confluence      # write tripwire notes back to decision pages (v2 API)
