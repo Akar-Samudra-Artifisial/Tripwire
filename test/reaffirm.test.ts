@@ -194,12 +194,15 @@ describe('reaffirmRevisit', () => {
     expect(repo.tripwires.get(tripwireId)).toMatchObject({ status: 'revisiting', strikes: 2, spec: { value: 10 } });
   });
 
-  it('refuses unknown issues and non-numeric tripwires', async () => {
+  it('refuses unknown issues', async () => {
     expect(await reaffirmRevisit('SUP-1', OWNER, { newThreshold: 45 }, deps)).toEqual({ error: 'This work item is not a Tripwire revisit task.' });
+  });
+
+  it('a checkin tripwire is reaffirmed without a threshold (per-kind reaffirm, see nonNumeric.test.ts)', async () => {
     const { tripwireId, decisionId } = seedTripwire(repo, { status: 'revisiting' });
     repo.tripwires.set(tripwireId, { ...repo.tripwires.get(tripwireId)!, kind: 'checkin', spec: { every: 'month', question: 'Still true?' } });
     await repo.insertRevisit({ id: 'rv-2', decisionId, issueKey: 'SUP-50', tripwireId, status: 'open' });
-    expect(await reaffirmRevisit('SUP-50', OWNER, { newThreshold: 45 }, deps)).toMatchObject({ error: expect.stringContaining('numeric') });
+    expect(await reaffirmRevisit('SUP-50', OWNER, { newThreshold: 45 }, deps)).toMatchObject({ reaffirmed: true, kind: 'checkin' });
   });
 
   it('after reaffirming to 45, the next reading of 37 is near and opens no Revisit', async () => {

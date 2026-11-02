@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { describeSpec } from '../../src/core/describe';
+import { describeSpec, formatReading } from '../../src/core/describe';
 import type { TripwireKind } from '../../src/core/types';
 import { call } from './bridge';
 import { ErrorText, Shell, StatusBadge } from './components';
@@ -19,6 +19,8 @@ interface Tripwire {
   lastValue: number | null;
   lastOutcome: string | null;
   lastEvaluatedAt: string | null;
+  confirmedAt?: string | null;
+  baselineVersion?: number | null;
 }
 
 interface Evaluation {
@@ -47,8 +49,16 @@ const POLL_LIMIT_MS = 90_000;
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-/** "7 / > 10 · safe · measured 2026-11-02" for numeric tripwires; outcome and date for the others. */
+/**
+ * "7 / > 10 · safe · measured 2026-11-02" for numeric tripwires; for the others the kind's own reading, e.g.
+ * "3 days left until 2027-03-31 (measured 2026-11-02) · near" or "check-in overdue by 1 day (measured …) · tripped".
+ */
 function Reading({ tripwire }: { tripwire: Tripwire }) {
+  if (tripwire.kind !== 'jql_threshold' && tripwire.kind !== 'graph_relation') {
+    if (tripwire.lastValue === null && !(tripwire.kind === 'checkin' && tripwire.confirmedAt)) return null;
+    const parts = [formatReading(tripwire), tripwire.lastOutcome ?? undefined].filter(Boolean);
+    return <p className="muted">{parts.join(' · ')}</p>;
+  }
   if (tripwire.lastOutcome === null && tripwire.lastValue === null) return null;
   const spec = tripwire.spec as { op?: string; value?: number };
   const numeric = tripwire.kind === 'jql_threshold' && tripwire.lastValue !== null;

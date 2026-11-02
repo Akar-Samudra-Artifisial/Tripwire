@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isJiraRateLimited } from '../adapters/jira';
-import type { Repo } from '../adapters/repo';
+import type { Repo, TripwirePatch } from '../adapters/repo';
 import { jqlGuard } from './extraction';
 import type { Settings } from './settings';
 import { EVALUABLE_STATUSES, nextState } from './state';
@@ -58,8 +58,9 @@ export function chunk<T>(items: readonly T[], size: number): T[][] {
 const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 /**
- * Reads one tripwire, records the evaluation, and moves it through the state machine. Two consecutive tripped
- * readings are needed to trip; a tripped tripwire asks `openRevisit` (which is idempotent) on every reading.
+ * Reads one tripwire, records the evaluation, and moves it through the state machine. Numeric kinds need two
+ * consecutive tripped readings to trip, date/checkin/content_change one (`strikesToTrip`); a tripped tripwire
+ * asks `openRevisit` (which is idempotent) on every reading.
  * `settings` lets `evaluateMany` load them once; JQL is re-checked against the allowed projects before counting.
  */
 export async function evaluateOne(tripwireId: string, deps: EvalDeps, settings?: Settings): Promise<EvalOutcome> {
@@ -90,6 +91,7 @@ export async function evaluateOne(tripwireId: string, deps: EvalDeps, settings?:
   }
 
   const now = deps.now();
+  const nowIso = now.toISOString();
   let reading: TriggerReading;
   try {
     switch (tripwire.kind) {
@@ -112,13 +114,17 @@ export async function evaluateOne(tripwireId: string, deps: EvalDeps, settings?:
     return { status: 'error', tripwireId, message: errorMessage(err) };
   }
 
-  const next = nextState({ status: from, strikes: tripwire.strikes }, reading.outcome);
-  const nowIso = now.toISOString();
+  const next = nextState({ status: from, strikes: tripwire.strikes }, reading.outcome, tripwire.kind);
+  // Starting points a tripwire may lack (older rows): a check-in without an answer counts from now, and a
+  // watched page without a baseline starts from the version just read. Neither trips on this reading.
+  const starts: TripwirePatch = {};
+  if (tripwire.kind === 'checkin' && !tripwire.confirmedAt) starts.confirmedAt = nowIso;
+  if (tripwire.kind === 'content_change' && tripwire.baselineVersion === null && reading.value !== null) starts.baselineVersion = reading.value;
   // CAS first (status + strikes): a run that lost the race must not leave an evaluation row behind.
   const ok = await repo.casTripwire(
     tripwireId,
     [tripwire.status],
-    { status: next.status, strikes: next.strikes, lastValue: reading.value, lastOutcome: reading.outcome, lastEvaluatedAt: nowIso },
+    { status: next.status, strikes: next.strikes, lastValue: reading.value, lastOutcome: reading.outcome, lastEvaluatedAt: nowIso, ...starts },
     { strikes: tripwire.strikes },
   );
   if (!ok) return { status: 'skipped', tripwireId, reason: 'concurrent' };

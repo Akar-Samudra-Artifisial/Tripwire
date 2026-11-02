@@ -16,13 +16,22 @@ interface RevisitView {
   revisit: { issueKey: string; status: string; createdAt: string; outcome?: string; newThreshold?: number };
   decision: { statement: string; title?: string };
   assumption: { quote: string; summary: string };
-  tripwire: { kind: TripwireKind; spec: unknown; status: string; strikes: number; lastValue: number | null; lastEvaluatedAt: string | null };
+  tripwire: {
+    kind: TripwireKind;
+    spec: unknown;
+    status: string;
+    strikes: number;
+    lastValue: number | null;
+    lastEvaluatedAt: string | null;
+    confirmedAt?: string | null;
+    baselineVersion?: number | null;
+  };
   evaluations: { id: string; value: number | null; outcome: string; evaluatedAt: string }[];
   pageUrl?: string;
   suggestedThreshold?: number;
 }
 
-interface ReaffirmResult {
+interface NumericReaffirmResult {
   reaffirmed: true;
   issueKey: string;
   oldThreshold: number;
@@ -31,7 +40,89 @@ interface ReaffirmResult {
   warnings: string[];
 }
 
+interface KindReaffirmResult {
+  reaffirmed: true;
+  issueKey: string;
+  kind: TripwireKind;
+  summary: string;
+  status: 'active';
+  warnings: string[];
+}
+
+type ReaffirmResult = NumericReaffirmResult | KindReaffirmResult;
+
+const isNumericResult = (r: ReaffirmResult): r is NumericReaffirmResult => 'newThreshold' in r;
+
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** Button label and confirmation text for Reaffirm on non-numeric tripwires. */
+const KIND_REAFFIRM: Partial<Record<TripwireKind, { label: string; confirm: string; explain: string }>> = {
+  checkin: {
+    label: 'Still true',
+    confirm: 'Confirm: still true',
+    explain: 'The decision stands, the check-in counts as answered today and this work item moves to Done.',
+  },
+  content_change: {
+    label: 'Accept page changes',
+    confirm: 'Confirm: accept changes',
+    explain: 'The decision stands, the current page version becomes the new baseline and this work item moves to Done.',
+  },
+  date: {
+    label: 'Mark date handled',
+    confirm: 'Confirm: date handled',
+    explain: 'The decision stands, this one-shot date tripwire stays safe from now on and this work item moves to Done.',
+  },
+};
+
+/** Reaffirm for date/checkin/content_change: no threshold, only an optional note and a two-click confirm. */
+function KindReaffirm({ kind, onDone }: { kind: TripwireKind; onDone: (r: ReaffirmResult) => void }) {
+  const [note, setNote] = useState('');
+  const [confirming, setConfirming] = useState(false);
+  const [state, setState] = useState<{ busy: boolean; error?: string }>({ busy: false });
+  const texts = KIND_REAFFIRM[kind];
+  if (!texts) return null;
+
+  const submit = () => {
+    if (!confirming) {
+      setConfirming(true);
+      return;
+    }
+    setState({ busy: true });
+    call<ReaffirmResult>('reaffirmRevisit', { note })
+      .then((r) => {
+        setState({ busy: false });
+        onDone(r);
+      })
+      .catch((e: unknown) => {
+        setState({ busy: false, error: message(e) });
+        setConfirming(false);
+      });
+  };
+
+  return (
+    <div className="setup__form">
+      <label>
+        Note (optional)
+        <input value={note} maxLength={500} onChange={(e) => setNote(e.target.value)} disabled={state.busy} />
+      </label>
+      <div className="assumption__actions">
+        <button type="button" className="setup__button" onClick={submit} disabled={state.busy}>
+          {state.busy ? 'Reaffirming…' : confirming ? texts.confirm : texts.label}
+        </button>
+        {confirming && !state.busy && (
+          <button type="button" className="setup__button" onClick={() => setConfirming(false)}>
+            Cancel
+          </button>
+        )}
+        <button type="button" disabled title="Coming soon">
+          Supersede (coming soon)
+        </button>
+      </div>
+      {confirming && !state.busy && <p className="muted">{texts.explain}</p>}
+      {state.error && <ErrorText>{state.error}</ErrorText>}
+    </div>
+  );
+}
 
 function Reaffirm({ view, onDone }: { view: RevisitView; onDone: (r: ReaffirmResult) => void }) {
   const [threshold, setThreshold] = useState(view.suggestedThreshold === undefined ? '' : String(view.suggestedThreshold));
@@ -120,6 +211,9 @@ function Revisit() {
   const { decision, assumption, tripwire, evaluations, pageUrl, revisit } = data;
   const closed = revisit.status === 'closed' || result !== undefined;
   const numeric = tripwire.kind === 'jql_threshold' || tripwire.kind === 'graph_relation';
+  const numericResult = result !== undefined && isNumericResult(result) ? result : undefined;
+  const kindResult = result !== undefined && !isNumericResult(result) ? result : undefined;
+  const shownSpec = numericResult ? { ...(tripwire.spec as object), value: numericResult.newThreshold } : tripwire.spec;
   return (
     <section>
       <h2 className="setup__heading">
@@ -140,8 +234,8 @@ function Revisit() {
       <h2 className="setup__heading">
         Tripwire <StatusBadge status={result ? result.status : tripwire.status} />
       </h2>
-      <p className="muted">{describeSpec(tripwire.kind, result ? { ...(tripwire.spec as object), value: result.newThreshold } : tripwire.spec)}</p>
-      <p>Now {formatReading(result ? { ...tripwire, spec: { ...(tripwire.spec as object), value: result.newThreshold } } : tripwire)}</p>
+      <p className="muted">{describeSpec(tripwire.kind, shownSpec)}</p>
+      <p>Now {kindResult ? kindResult.summary : formatReading({ ...tripwire, spec: shownSpec })}</p>
       <h2 className="setup__heading">Trend</h2>
       {evaluations.length === 0 ? (
         <p className="muted">No evaluations recorded.</p>
@@ -157,7 +251,8 @@ function Revisit() {
       {result && (
         <>
           <p role="status">
-            Reaffirmed: threshold {result.oldThreshold} → {result.newThreshold}. The tripwire is active again and the revisit is CLOSED.
+            Reaffirmed: {numericResult ? `threshold ${numericResult.oldThreshold} → ${numericResult.newThreshold}` : kindResult?.summary}. The tripwire is
+            active again and the revisit is CLOSED.
           </p>
           {result.warnings.map((w) => (
             <ErrorText key={w}>{w}</ErrorText>
@@ -171,16 +266,7 @@ function Revisit() {
         </p>
       )}
       {!closed && numeric && <Reaffirm view={data} onDone={setResult} />}
-      {!closed && !numeric && (
-        <div className="assumption__actions">
-          <button type="button" disabled title="Only numeric tripwires can be reaffirmed with a new threshold">
-            Reaffirm (numeric tripwires only)
-          </button>
-          <button type="button" disabled title="Coming soon">
-            Supersede (coming soon)
-          </button>
-        </div>
-      )}
+      {!closed && !numeric && <KindReaffirm kind={tripwire.kind} onDone={setResult} />}
     </section>
   );
 }

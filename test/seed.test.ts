@@ -88,6 +88,7 @@ function makeDeps(world: World, repo: FakeRepo, evaluate?: SeedDeps['evaluate'])
       world.labels.push(label);
     }),
     canEditPage: vi.fn(async () => true),
+    updatePage: vi.fn(async () => 2),
   };
   const deps: SeedDeps = {
     jira,
@@ -262,6 +263,26 @@ describe('simulateBusyMonth', () => {
     expect(result).toMatchObject({ created: 30, issueCount: 37, indexed: true, complete: true, revisits: [{ tripwireId, issueKey: 'SUP-99' }] });
     expect(repo.appValues.get(DEMO_STATE_KEY)).toMatchObject({ simulatedTickets: 30 });
     expect(repo.appLocks.has(SIMULATE_LOCK)).toBe(false);
+  });
+
+  it('moves date/checkin a month on and edits the page for content_change before evaluating', async () => {
+    const { decisionId, assumptionId } = demoTripwire(repo);
+    const base = { assumptionId, status: 'active' as const, confirmedBy: 'owner-1', strikes: 0, lastValue: null, lastOutcome: null, lastEvaluatedAt: null };
+    repo.tripwires.set('tw-date', { ...base, id: 'tw-date', kind: 'date', spec: { date: '2027-03-31', leadDays: 30 }, confirmedAt: '2026-10-01T00:00:00.000Z', baselineVersion: null });
+    repo.tripwires.set('tw-done', { ...base, id: 'tw-done', kind: 'date', spec: { date: '2026-10-01', leadDays: 3, resolved: true }, baselineVersion: null });
+    repo.tripwires.set('tw-check', { ...base, id: 'tw-check', kind: 'checkin', spec: { every: 'quarter', question: 'Still on PDF?' }, confirmedAt: '2026-11-01T00:00:00.000Z', baselineVersion: null });
+    repo.tripwires.set('tw-page', { ...base, id: 'tw-page', kind: 'content_change', spec: { pageId: '1', watch: 'any_edit' }, baselineVersion: 1 });
+    const { deps, confluence } = makeDeps({ project: true, tickets: 7, labels: [] }, repo, tripping(decisionId));
+
+    await simulateBusyMonth(deps);
+
+    expect(repo.tripwires.get('tw-date')?.spec).toEqual({ date: '2026-11-01', leadDays: 30 });
+    expect(repo.tripwires.get('tw-done')?.spec).toEqual({ date: '2026-10-01', leadDays: 3, resolved: true });
+    // quarter = 91 days, plus one: overdue by a day.
+    expect(repo.tripwires.get('tw-check')?.confirmedAt).toBe(new Date(Date.parse('2026-11-02T10:00:00Z') - 92 * 86_400_000).toISOString());
+    const pageId = repo.decisions.get(decisionId)!.pageId;
+    expect(confluence.updatePage).toHaveBeenCalledTimes(1);
+    expect(confluence.updatePage).toHaveBeenCalledWith(pageId, expect.stringContaining('Reviewed 2026-11-02'), expect.any(String));
   });
 
   it('a second click reuses the tickets and only evaluates', async () => {

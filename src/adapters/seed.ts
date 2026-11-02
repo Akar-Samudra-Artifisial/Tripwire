@@ -1,6 +1,8 @@
 import { summarise, type EvalOutcome } from '../core/evaluator';
 import { normaliseSettings, type Settings } from '../core/settings';
 import { EVALUABLE_STATUSES } from '../core/state';
+import { PERIOD_DAYS } from '../core/triggers/checkin';
+import type { CheckinSpec, DateSpec } from '../core/types';
 import type { confluence as confluenceAdapter } from './confluence';
 import type { AdfDoc, jira as jiraAdapter } from './jira';
 import type { Repo } from './repo';
@@ -109,7 +111,7 @@ export interface SeedDeps {
   >;
   confluence: Pick<
     typeof confluenceAdapter,
-    'findSpace' | 'createSpace' | 'findPageByTitle' | 'createPage' | 'getPageLabels' | 'addPageLabel' | 'canEditPage'
+    'findSpace' | 'createSpace' | 'findPageByTitle' | 'createPage' | 'getPageLabels' | 'addPageLabel' | 'canEditPage' | 'updatePage'
   >;
   repo: Pick<
     Repo,
@@ -302,6 +304,41 @@ export interface SimulateResult {
   revisits: { tripwireId: string; issueKey: string }[];
 }
 
+const DAY_MS = 86_400_000;
+const isoDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
+
+/** Demo page body after "Simulate a busy month" edited it (same text plus a dated review note, so edits never pile up). */
+export const simulatedPageStorage = (day: string): string =>
+  `${DEMO_PAGE_STORAGE}<p><em>Reviewed ${day} by the Reporting squad (demo edit by Tripwire "Simulate a busy month").</em></p>`;
+
+/**
+ * Moves the demo's non-numeric tripwires a month on, so one evaluation trips them: a date tripwire's date becomes
+ * yesterday, a check-in's last answer goes one period plus a day back, and a watched page gets a new version.
+ * Only `active`/`near` tripwires are touched (by CAS); handled dates stay handled. Returns how many were moved.
+ */
+async function ageDemoTripwires(pageId: string, decisionId: string, deps: SeedDeps): Promise<number> {
+  const { repo } = deps;
+  const now = deps.now();
+  let aged = 0;
+  let pageEdited = false;
+  for (const t of await repo.listTripwires(decisionId)) {
+    if (t.status !== 'active' && t.status !== 'near') continue;
+    if (t.kind === 'date') {
+      const spec = t.spec as DateSpec;
+      if (spec.resolved) continue;
+      if (await repo.casTripwire(t.id, [t.status], { spec: { ...spec, date: isoDay(now - DAY_MS) } })) aged += 1;
+    } else if (t.kind === 'checkin') {
+      const days = PERIOD_DAYS[(t.spec as CheckinSpec).every] + 1;
+      if (await repo.casTripwire(t.id, [t.status], { confirmedAt: new Date(now - days * DAY_MS).toISOString() })) aged += 1;
+    } else if (t.kind === 'content_change' && !pageEdited) {
+      await deps.confluence.updatePage(pageId, simulatedPageStorage(isoDay(now)), 'Demo edit by Tripwire "Simulate a busy month"');
+      pageEdited = true;
+      aged += 1;
+    }
+  }
+  return aged;
+}
+
 /** Waits until Jira's approximate count sees at least `target` demo tickets (search is eventually consistent). */
 async function waitForCount(target: number, deps: SeedDeps): Promise<{ count: number; indexed: boolean }> {
   const deadline = deps.now() + INDEX_WAIT_MS;
@@ -314,8 +351,9 @@ async function waitForCount(target: number, deps: SeedDeps): Promise<{ count: nu
 }
 
 /**
- * "A busy month": adds 30 `export` tickets to SUP once, then evaluates the demo decision's confirmed tripwires
- * twice in a row so a crossed threshold gets its two strikes, trips and opens a Revisit task (inline, no queue).
+ * "A busy month": adds 30 `export` tickets to SUP once, moves the date/checkin/content_change tripwires a month on
+ * (`ageDemoTripwires`), then evaluates the demo decision's confirmed tripwires twice in a row so a crossed
+ * threshold gets its two strikes (the others trip on the first), trips and opens a Revisit task (inline, no queue).
  * The tickets are remembered in the `demo` app value: when time runs out, clicking again only evaluates.
  */
 export async function simulateBusyMonth(deps: SeedDeps): Promise<SimulateResult> {
@@ -349,6 +387,12 @@ export async function simulateBusyMonth(deps: SeedDeps): Promise<SimulateResult>
       });
     }
     const { count, indexed } = await waitForCount(target, deps);
+
+    // A month passes for the date/checkin/content_change tripwires too, so the same evaluation trips them.
+    if (indexed && decision) {
+      const aged = await ageDemoTripwires(state.pageId as string, decision.id, deps);
+      if (aged > 0) console.info('tripwire simulateBusyMonth: non-numeric tripwires moved a month on', { aged });
+    }
 
     const passes: SimulateResult['passes'] = [];
     const revisitIds = new Set<string>();

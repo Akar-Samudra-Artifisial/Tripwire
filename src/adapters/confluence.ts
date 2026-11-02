@@ -133,6 +133,24 @@ export const confluence = {
     return { id: String(page.id), webUrl: links?.base && links.webui ? `${links.base}${links.webui}` : undefined };
   },
 
+  /** Replaces the body of a current page (storage-format XHTML) as a new version; returns that version number. */
+  async updatePage(pageId: string, storage: string, versionMessage: string): Promise<number> {
+    const current = await this.getPage(pageId);
+    const res = await api.asApp().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: pageId,
+        status: 'current',
+        title: current.title,
+        body: { representation: 'storage', value: storage },
+        version: { number: current.version + 1, message: versionMessage },
+      }),
+    });
+    const page = await readJson<RawPage>(res, `update page ${pageId}`);
+    return page.version.number;
+  },
+
   /** Adds a global label (v1 API: v2 has no label write endpoint). */
   async addPageLabel(pageId: string, label: string): Promise<void> {
     const res = await api.asApp().requestConfluence(route`/wiki/rest/api/content/${pageId}/label`, {
