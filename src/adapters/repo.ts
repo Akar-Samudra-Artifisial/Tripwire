@@ -80,6 +80,13 @@ export interface DeletedTree {
 /** Per-page timestamps on `decisions`: a scan cooldown and two short-lived locks (see `acquirePageLock`). */
 export type PageLock = 'scan' | 'extract' | 'revisit';
 
+/** Extra conditions of `casTripwire`. */
+export interface TripwireExpect {
+  strikes?: number;
+  /** `null` matches a tripwire without a baseline. */
+  baselineVersion?: number | null;
+}
+
 const PAGE_LOCK_COLUMNS: Record<PageLock, string> = {
   scan: 'scan_cooldown_until',
   extract: 'extract_lock_until',
@@ -100,8 +107,11 @@ export interface Repo {
   replaceProposed(decisionId: string, items: { assumption: Assumption; tripwire: TripwireRow }[]): Promise<void>;
   getTripwireContext(id: string): Promise<TripwireContext | undefined>;
   listTripwireIdsForEvaluation(statuses: readonly TripwireStatus[], limit: number, offset: number): Promise<string[]>;
-  /** Status CAS; `expect.strikes` also has to match. Bumps `version`, so a matching row always counts as changed. */
-  casTripwire(id: string, fromStatuses: readonly TripwireStatus[], patch: TripwirePatch, expect?: { strikes?: number }): Promise<boolean>;
+  /**
+   * Status CAS; `expect.strikes` / `expect.baselineVersion` (null matches NULL) also have to match. Bumps `version`,
+   * so a matching row always counts as changed.
+   */
+  casTripwire(id: string, fromStatuses: readonly TripwireStatus[], patch: TripwirePatch, expect?: TripwireExpect): Promise<boolean>;
   insertEvaluation(e: EvaluationRow): Promise<void>;
   listEvaluations(tripwireId: string, limit: number): Promise<EvaluationRow[]>;
   findOpenRevisit(decisionId: string): Promise<RevisitRow | undefined>;
@@ -122,7 +132,8 @@ export interface Repo {
    * False when another holder's time has not run out yet.
    */
   acquirePageLock(pageId: string, lock: PageLock, nowIso: string, seconds: number): Promise<boolean>;
-  releasePageLock(pageId: string, lock: PageLock): Promise<void>;
+  /** Frees the lock; with `heldUntil` (the end time this holder set) only while it is still that holder's lock. */
+  releasePageLock(pageId: string, lock: PageLock, heldUntil?: string): Promise<void>;
   /** Atomically takes the named app-wide lock until now + `seconds`; false while another holder's time runs. */
   acquireAppLock(name: string, nowIso: string, seconds: number): Promise<boolean>;
   releaseAppLock(name: string): Promise<void>;
@@ -155,6 +166,10 @@ export interface Repo {
   updateRadarPairGraph(id: string, graph: PairGraph, fetchedAt: string, keepOkSince?: string): Promise<boolean>;
   /** Clears graph caches written before they held aggregates only (they contained contributor account ids). */
   purgeLegacyRadarGraphs(): Promise<number>;
+  /** Clears the non-`ok` graph caches of the decision's pairs (fetched again on the next view); returns how many. */
+  clearRadarGraphCache(decisionId: string): Promise<number>;
+  /** Sets the extracted page version from `from` to `to`; false when it was not `from` (or no decision). */
+  setDecisionPageVersion(pageId: string, from: number, to: number): Promise<boolean>;
   /** Status CAS; false when the pair is missing or not in `from`. */
   setRadarPairStatus(id: string, from: readonly RadarStatus[], to: RadarStatus): Promise<boolean>;
 }
@@ -508,12 +523,15 @@ export const sqlRepo: Repo = {
     const sets = [...entries.map((k) => `${PATCH_COLUMNS[k][0]} = ?`), '`version` = `version` + 1'];
     const values = entries.map((k) => (PATCH_COLUMNS[k][1] as (v: unknown) => unknown)(patch[k]));
     const strikes = expect?.strikes;
+    const baseline = expect?.baselineVersion;
     const affected = await execute(
-      `UPDATE tripwires SET ${sets.join(', ')} WHERE id = ? AND status IN (${placeholders(fromStatuses.length)})${strikes !== undefined ? ' AND strikes = ?' : ''}`,
+      `UPDATE tripwires SET ${sets.join(', ')} WHERE id = ? AND status IN (${placeholders(fromStatuses.length)})` +
+        `${strikes !== undefined ? ' AND strikes = ?' : ''}${baseline !== undefined ? ' AND baseline_version <=> ?' : ''}`,
       ...values,
       id,
       ...fromStatuses,
       ...(strikes !== undefined ? [strikes] : []),
+      ...(baseline !== undefined ? [baseline] : []),
     );
     return affected === 1;
   },
@@ -669,9 +687,13 @@ export const sqlRepo: Repo = {
     return affected === 1;
   },
 
-  async releasePageLock(pageId, lock) {
+  async releasePageLock(pageId, lock, heldUntil) {
     const column = PAGE_LOCK_COLUMNS[lock];
-    await execute(`UPDATE decisions SET ${column} = NULL WHERE page_id = ?`, pageId);
+    if (heldUntil === undefined) {
+      await execute(`UPDATE decisions SET ${column} = NULL WHERE page_id = ?`, pageId);
+      return;
+    }
+    await execute(`UPDATE decisions SET ${column} = NULL WHERE page_id = ? AND ${column} = ?`, pageId, toSqlTs(heldUntil));
   },
 
   async acquireAppLock(name, nowIso, seconds) {
@@ -791,6 +813,20 @@ export const sqlRepo: Repo = {
 
   async purgeLegacyRadarGraphs() {
     return execute(`UPDATE radar_pairs SET graph_json = NULL, graph_fetched_at = NULL WHERE JSON_EXTRACT(graph_json, '$.a') IS NOT NULL`);
+  },
+
+  async clearRadarGraphCache(decisionId) {
+    return execute(
+      `UPDATE radar_pairs SET graph_json = NULL, graph_fetched_at = NULL
+       WHERE (decision_a_id = ? OR decision_b_id = ?) AND graph_json IS NOT NULL
+       AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(graph_json, '$.state')), '') <> 'ok'`,
+      decisionId,
+      decisionId,
+    );
+  },
+
+  async setDecisionPageVersion(pageId, from, to) {
+    return (await execute('UPDATE decisions SET page_version = ? WHERE page_id = ? AND page_version = ?', to, pageId, from)) === 1;
   },
 
   async setRadarPairStatus(id, from, to) {

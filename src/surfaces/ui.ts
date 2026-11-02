@@ -17,7 +17,8 @@ import type { Assumption, JqlThresholdSpec } from '../core/types';
 import { asUserGraph, cloudIdFromInstallContext, fetchPairGraph } from '../adapters/teamworkGraph';
 import { randomUUID } from 'node:crypto';
 import { enqueueDemoJob, enqueueExtraction, enqueueLlmProbe, enqueueRadarScan, evalDeps, RADAR_LAST_SCAN_KEY } from './background';
-import { DEMO_JOB_LABELS, publicJob, readDemoJob, startDemoJob, type DemoJobDeps, type DemoJobKind, type PublicDemoJob } from './demoJob';
+import { DEMO_JOB_LABELS, isActive, publicJob, readDemoJob, startDemoJob, type DemoJobDeps, type DemoJobKind, type PublicDemoJob } from './demoJob';
+import { stampDemoReviews, type StampResult } from './demoStamp';
 import { radarGraphContextWith, radarListWith, RadarNotFoundError, type RadarViewDeps } from './radar';
 
 const resolver = new Resolver();
@@ -183,6 +184,28 @@ function startDemo(context: unknown, kind: DemoJobKind) {
 resolver.define('loadDemoData', ({ context }) => startDemo(context, 'load'));
 resolver.define('simulateBusyMonth', ({ context }) => startDemo(context, 'simulate'));
 resolver.define('resetDemo', ({ context }) => startDemo(context, 'reset'));
+
+/**
+ * Called by the setup page once "Load demo data" is done: adds "Reviewed by <admin>." to the demo pages as the
+ * admin (a queue consumer cannot act as a user), so Teamwork Graph sees a human contributor on each page.
+ */
+resolver.define('stampDemoReviews', ({ context }) =>
+  adminOnly(context, 'Add demo review notes', async (): Promise<StampResult> => {
+    await ensureSchema();
+    const job = await readDemoJob(demoJobDeps());
+    if (job && isActive(job)) throw new SeedError('A demo job is still running, try again when it is done.');
+    const accountId = (context as ResolverContext).accountId as string;
+    const result = await stampDemoReviews(await listDemoPageIds(sqlRepo), accountId, {
+      repo: sqlRepo,
+      canEdit: (pageId) => confluence.canEditPage(pageId),
+      getPage: (pageId) => confluence.getPageAsUser(pageId),
+      updatePage: (pageId, page) => confluence.updatePageAsUser(pageId, page),
+      now: () => Date.now(),
+    });
+    console.info('tripwire stampDemoReviews', result);
+    return result;
+  }),
+);
 
 /** Polled by the setup page while a demo job runs; also tells a reopened page about a job still running. */
 resolver.define('getDemoJob', ({ context }) =>

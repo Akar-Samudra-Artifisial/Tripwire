@@ -183,6 +183,19 @@ describe('evaluateOne for non-numeric kinds', () => {
     expect(await evaluateOne(tripwireId, deps)).toMatchObject({ outcome: 'tripped', newStatus: 'tripped', revisitRequested: true });
     expect(repo.tripwires.get(tripwireId)?.baselineVersion).toBe(4);
   });
+
+  it('content_change: a reading against a baseline moved meanwhile (demo note, Accept) does not count', async () => {
+    const { tripwireId } = seedTripwire(repo);
+    asKind(tripwireId, { kind: 'content_change', spec: { pageId: '1', watch: 'any_edit' }, baselineVersion: 3 });
+    deps.readers.content_change = async (_spec, baseline) => {
+      // The demo review note moved the baseline to 4 while the page (already at 4) was read.
+      asKind(tripwireId, { baselineVersion: 4 });
+      return contentChangeReading(4, baseline);
+    };
+    expect(await evaluateOne(tripwireId, deps)).toEqual({ status: 'skipped', tripwireId, reason: 'concurrent' });
+    expect(repo.tripwires.get(tripwireId)).toMatchObject({ status: 'active', baselineVersion: 4 });
+    expect(openRevisit).not.toHaveBeenCalled();
+  });
 });
 
 describe('reaffirmRevisit per kind', () => {

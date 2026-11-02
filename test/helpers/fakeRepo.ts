@@ -118,6 +118,7 @@ export function fakeRepo(): FakeRepo {
       const current = repo.tripwires.get(id);
       if (!current || !fromStatuses.includes(current.status)) return false;
       if (expect?.strikes !== undefined && current.strikes !== expect.strikes) return false;
+      if (expect?.baselineVersion !== undefined && current.baselineVersion !== expect.baselineVersion) return false;
       repo.versions.set(id, (repo.versions.get(id) ?? 0) + 1);
       const defined = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
       repo.tripwires.set(id, { ...current, ...clone(defined) } as TripwireRow);
@@ -228,8 +229,12 @@ export function fakeRepo(): FakeRepo {
       repo.pageLocks.set(pageId, { ...locks, [lock]: new Date(Date.parse(nowIso) + seconds * 1000).toISOString() });
       return true;
     },
-    async releasePageLock(pageId, lock) {
+    async releasePageLock(pageId, lock, heldUntil) {
       const locks = repo.pageLocks.get(pageId);
+      // Second precision, like the TIMESTAMP column.
+      const sec = (iso: string) => Math.floor(Date.parse(iso) / 1000);
+      const current = locks?.[lock];
+      if (heldUntil !== undefined && (current === undefined || sec(current) !== sec(heldUntil))) return;
       if (locks) repo.pageLocks.set(pageId, { ...locks, [lock]: undefined });
     },
     async acquireAppLock(name, nowIso, seconds) {
@@ -346,6 +351,22 @@ export function fakeRepo(): FakeRepo {
         }
       }
       return n;
+    },
+    async clearRadarGraphCache(decisionId) {
+      let n = 0;
+      for (const p of repo.radarPairs.values()) {
+        if ((p.decisionAId === decisionId || p.decisionBId === decisionId) && p.graph && p.graph.state !== 'ok') {
+          repo.radarPairs.set(p.id, { ...p, graph: null, graphFetchedAt: null });
+          n += 1;
+        }
+      }
+      return n;
+    },
+    async setDecisionPageVersion(pageId, from, to) {
+      const d = [...repo.decisions.values()].find((x) => x.pageId === pageId);
+      if (!d || d.pageVersion !== from) return false;
+      repo.decisions.set(d.id, { ...d, pageVersion: to });
+      return true;
     },
     async setRadarPairStatus(id, from, to) {
       const p = repo.radarPairs.get(id);

@@ -124,12 +124,13 @@ export async function evaluateOne(tripwireId: string, deps: EvalDeps, settings?:
   const starts: TripwirePatch = {};
   if (tripwire.kind === 'checkin' && !tripwire.confirmedAt) starts.confirmedAt = nowIso;
   if (tripwire.kind === 'content_change' && tripwire.baselineVersion === null && reading.value !== null) starts.baselineVersion = reading.value;
-  // CAS first (status + strikes): a run that lost the race must not leave an evaluation row behind.
+  // CAS first (status + strikes): a run that lost the race must not leave an evaluation row behind. A content_change
+  // reading only holds for the baseline it was compared with (moved by Accept page changes or the demo review note).
   const ok = await repo.casTripwire(
     tripwireId,
     [tripwire.status],
     { status: next.status, strikes: next.strikes, lastValue: reading.value, lastOutcome: reading.outcome, lastEvaluatedAt: nowIso, ...starts },
-    { strikes: tripwire.strikes },
+    tripwire.kind === 'content_change' ? { strikes: tripwire.strikes, baselineVersion: tripwire.baselineVersion } : { strikes: tripwire.strikes },
   );
   if (!ok) return { status: 'skipped', tripwireId, reason: 'concurrent' };
   try {

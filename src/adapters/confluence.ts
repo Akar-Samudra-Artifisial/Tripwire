@@ -87,6 +87,42 @@ export const confluence = {
   },
 
   /**
+   * Title, version and storage body as the current user sees them; undefined on 401/403/404. Runs as the user
+   * (resolvers only); platform errors propagate.
+   */
+  async getPageAsUser(pageId: string): Promise<{ title: string; version: number; body: string } | undefined> {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}?body-format=storage`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (res.status === 401 || res.status === 403 || res.status === 404) return undefined;
+    const page = await readJson<RawPage>(res, `get page ${pageId} as user`);
+    const body = page.body?.storage?.value;
+    // Writing back a body that was not returned would wipe the page.
+    if (typeof body !== 'string') throw new Error(`Confluence get page ${pageId} as user returned no storage body`);
+    return { title: page.title, version: page.version.number, body };
+  },
+
+  /**
+   * Replaces the body as the current user (they become a page contributor), as version `version`; returns the
+   * saved version. Runs as the user (resolvers only); a version conflict or missing permission throws.
+   */
+  async updatePageAsUser(pageId: string, page: { title: string; body: string; version: number; message: string }): Promise<number> {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: pageId,
+        status: 'current',
+        title: page.title,
+        body: { representation: 'storage', value: page.body },
+        version: { number: page.version, message: page.message },
+      }),
+    });
+    const saved = await readJson<RawPage>(res, `update page ${pageId} as user`);
+    return saved.version.number;
+  },
+
+  /**
    * Whether the current user may administer the space (v2 space operations, as the user). False on 401/403/404;
    * other failures throw (callers fail closed).
    */

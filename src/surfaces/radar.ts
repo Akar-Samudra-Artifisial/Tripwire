@@ -5,8 +5,8 @@ import type { TripwireStatus } from '../core/types';
 
 /** Graph context older than this is fetched again when the Radar is opened. */
 export const GRAPH_TTL_MS = 24 * 60 * 60 * 1000;
-/** "unavailable" / "partial" is retried sooner: pages get indexed within hours, failed lookups may recover. */
-export const GRAPH_UNAVAILABLE_TTL_MS = 60 * 60 * 1000;
+/** "unavailable" / "partial" is retried soon: a fresh human edit is usually indexed within minutes. The per-pair cooldown still caps fan-out. */
+export const GRAPH_UNAVAILABLE_TTL_MS = 2 * 60 * 1000;
 /** Per-pair cooldown between Teamwork Graph fetches, so repeated refreshes cannot fan out graph queries. */
 export const GRAPH_FETCH_COOLDOWN_SECONDS = 60;
 /** Must pass `appKey` in repo.ts (`^[a-z][a-z0-9-]{0,63}$`): no ':' and lower case (pair ids are UUIDs, 48 chars). */

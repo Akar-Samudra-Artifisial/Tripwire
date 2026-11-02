@@ -30,7 +30,7 @@ Installing requires an organization admin, because Tripwire reads Teamwork Graph
 1. Open the link above and install Tripwire on your site (Confluence and Jira).
 2. In Jira, go to **Settings → Apps → Tripwire setup**.
 3. Click **Initialise** (a new install sets up its database in a minute or two; the page shows the progress).
-4. Click **Load demo data** and wait until the page shows the result (one click; progress is shown while it runs).
+4. Click **Load demo data** and wait until the page shows the result (one click; progress is shown while it runs). Keep the page open a moment: it then adds "Reviewed by <you>." to the demo pages as you, so the Radar can show Teamwork Graph contributors.
 5. In Confluence, open the page **Defer CSV export** in the **Decisions (DEC)** space and click **Accept** on its tripwire.
 6. Back in Tripwire setup, click **Simulate a busy month** and wait for the result, e.g. "Revisit: SUP-12".
 7. Open that Revisit issue in the **SUP** project to see why the decision should be reopened, then click **Reaffirm** on an assumption to re-arm it.
