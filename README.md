@@ -32,6 +32,8 @@ forge install --site <site>.atlassian.net --product jira -e development
 - `src/surfaces/` – UI resolver, Rovo actions, event triggers and queue consumers
 - `ui/` – Custom UI sources, built into `static/`
 
+Privacy policy: [docs/PRIVACY.md](docs/PRIVACY.md) · Terms of service: [docs/TERMS.md](docs/TERMS.md)
+
 ## License
 
 MIT
