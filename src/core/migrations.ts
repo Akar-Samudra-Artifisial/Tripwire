@@ -81,4 +81,46 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       KEY idx_relations_to (to_id, type)
     )`,
   },
+  {
+    name: 'v007_create_settings',
+    statement: `CREATE TABLE IF NOT EXISTS settings (
+      k VARCHAR(64) PRIMARY KEY,
+      v JSON NOT NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`,
+  },
+  // One ADD per ALTER: multi-clause ALTER TABLE is not guaranteed on Forge SQL.
+  { name: 'v008a_decisions_title', statement: 'ALTER TABLE decisions ADD COLUMN IF NOT EXISTS title VARCHAR(255) NULL' },
+  { name: 'v008b_decisions_page_version', statement: 'ALTER TABLE decisions ADD COLUMN IF NOT EXISTS page_version INT NULL' },
+  { name: 'v008c_decisions_extracted_at', statement: 'ALTER TABLE decisions ADD COLUMN IF NOT EXISTS extracted_at TIMESTAMP NULL' },
+  { name: 'v008d_decisions_extract_error', statement: 'ALTER TABLE decisions ADD COLUMN IF NOT EXISTS extract_error TEXT NULL' },
+  { name: 'v009a_tripwires_strikes', statement: 'ALTER TABLE tripwires ADD COLUMN IF NOT EXISTS strikes INT NOT NULL DEFAULT 0' },
+  // IF NOT EXISTS everywhere (added to v008a–v009a later; names unchanged) so a run racing another invocation
+  // (column added, name not yet recorded) can still complete. `last_value` is a reserved word in TiDB (window function) and must be backticked.
+  { name: 'v009b_tripwires_last_value', statement: 'ALTER TABLE tripwires ADD COLUMN IF NOT EXISTS `last_value` DOUBLE NULL' },
+  { name: 'v009c_tripwires_last_outcome', statement: 'ALTER TABLE tripwires ADD COLUMN IF NOT EXISTS last_outcome VARCHAR(16) NULL' },
+  { name: 'v009d_tripwires_last_evaluated_at', statement: 'ALTER TABLE tripwires ADD COLUMN IF NOT EXISTS last_evaluated_at TIMESTAMP NULL' },
+  { name: 'v009e_tripwires_baseline_version', statement: 'ALTER TABLE tripwires ADD COLUMN IF NOT EXISTS baseline_version INT NULL' },
+  { name: 'v010_evaluations_detail', statement: 'ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS detail VARCHAR(255) NULL' },
+  { name: 'v011a_revisits_tripwire_id', statement: 'ALTER TABLE revisits ADD COLUMN IF NOT EXISTS tripwire_id VARCHAR(36) NULL' },
+  { name: 'v011b_revisits_status', statement: "ALTER TABLE revisits ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'open'" },
+  { name: 'v011c_revisits_resolved_by', statement: 'ALTER TABLE revisits ADD COLUMN IF NOT EXISTS resolved_by VARCHAR(128) NULL' },
+  { name: 'v011d_revisits_resolved_at', statement: 'ALTER TABLE revisits ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP NULL' },
+  { name: 'v011e_revisits_open_index', statement: 'ALTER TABLE revisits ADD INDEX IF NOT EXISTS idx_revisits_open (decision_id, status)' },
+  // Per-page cooldown/locks (`Repo.acquirePageLock`) and an optimistic-lock counter for `casTripwire`.
+  { name: 'v012_decisions_scan_cooldown_until', statement: 'ALTER TABLE decisions ADD COLUMN IF NOT EXISTS scan_cooldown_until TIMESTAMP NULL' },
+  { name: 'v013_decisions_revisit_lock_until', statement: 'ALTER TABLE decisions ADD COLUMN IF NOT EXISTS revisit_lock_until TIMESTAMP NULL' },
+  { name: 'v014_decisions_extract_lock_until', statement: 'ALTER TABLE decisions ADD COLUMN IF NOT EXISTS extract_lock_until TIMESTAMP NULL' },
+  { name: 'v015_tripwires_version', statement: 'ALTER TABLE tripwires ADD COLUMN IF NOT EXISTS `version` INT NOT NULL DEFAULT 0' },
+  // App-wide named locks (`Repo.acquireAppLock`), e.g. the demo seed buttons.
+  {
+    name: 'v016_create_app_locks',
+    statement: `CREATE TABLE IF NOT EXISTS app_locks (
+      name VARCHAR(64) PRIMARY KEY,
+      until_at TIMESTAMP NULL
+    )`,
+  },
 ];
+
+/** Name of the newest migration; `initialise` reports it so admins can confirm the schema is current. */
+export const LATEST_MIGRATION = MIGRATIONS[MIGRATIONS.length - 1]?.name ?? '';
