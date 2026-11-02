@@ -1,13 +1,14 @@
 import { InvocationError, InvocationErrorCode, Queue } from '@forge/events';
 import { confluence } from '../adapters/confluence';
 import { jira } from '../adapters/jira';
-import { sqlRepo } from '../adapters/repo';
+import { sqlRepo, type Repo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { BATCH_SIZE, chunk, EvaluationRateLimitedError, evaluateMany, summarise, type EvalDeps } from '../core/evaluator';
 import { extractPage, type ExtractDeps } from '../core/extractPipeline';
 import { openRevisit } from '../core/revisit';
 import { EVALUABLE_STATUSES } from '../core/state';
 import { checkin, contentChange, date, jqlThreshold } from '../core/triggers';
+import type { ContentChangeSpec } from '../core/types';
 import { chatTool, isLlmRateLimited } from '../llm';
 import { repairAssumption, runExtraction } from '../llm/extract';
 
@@ -54,11 +55,36 @@ interface PageEvent {
   content?: { id?: string; type?: string };
 }
 
-/** Confluence page created/updated → enqueue extraction for labelled pages in watched spaces (LLM work runs only in the consumer). */
+/**
+ * Ids of the confirmed content_change tripwires watching `pageId` (a content_change tripwire can only watch its
+ * own decision page, so the page's decision is enough).
+ */
+export async function contentChangeTripwireIds(pageId: string, repo: Pick<Repo, 'getDecisionByPage' | 'listTripwires'>): Promise<string[]> {
+  const decision = await repo.getDecisionByPage(pageId);
+  if (!decision) return [];
+  return (await repo.listTripwires(decision.id))
+    .filter((t) => t.kind === 'content_change' && EVALUABLE_STATUSES.includes(t.status) && (t.spec as ContentChangeSpec).pageId === pageId)
+    .map((t) => t.id);
+}
+
+/**
+ * Confluence page created/updated → queue an evaluation of the page's content_change tripwires right away, and
+ * enqueue extraction for labelled pages in watched spaces (LLM work runs only in the consumer).
+ */
 export async function onPageEvent(event: PageEvent): Promise<void> {
   const pageId = event.content?.id;
   if (!pageId) return;
   await ensureSchema();
+  try {
+    const ids = await contentChangeTripwireIds(pageId, sqlRepo);
+    if (ids.length > 0) {
+      await pushBatches(ids);
+      console.info('tripwire onPageEvent: content_change evaluation queued', { pageId, tripwires: ids.length });
+    }
+  } catch (err) {
+    // The daily run still evaluates these; do not lose the extraction below.
+    console.warn('tripwire onPageEvent: content_change evaluation not queued', { pageId, error: err instanceof Error ? err.message : String(err) });
+  }
   const settings = await sqlRepo.getSettings();
   const labels = await confluence.getPageLabels(pageId);
   if (!labels.includes(settings.decisionLabel)) return;

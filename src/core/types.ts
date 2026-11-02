@@ -42,6 +42,8 @@ export interface DateSpec {
   /** ISO date, YYYY-MM-DD. */
   date: string;
   leadDays: number;
+  /** Set by Reaffirm: the date was handled, so this one-shot tripwire stays safe from then on. */
+  resolved?: boolean;
 }
 
 export interface ContentChangeSpec {

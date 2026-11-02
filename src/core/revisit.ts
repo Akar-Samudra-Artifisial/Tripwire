@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { JiraError, JiraUnavailableError, type AdfDoc, type jira } from '../adapters/jira';
-import type { DecisionRow, EvaluationRow, Repo, RevisitRow, TripwireContext } from '../adapters/repo';
+import type { DecisionRow, EvaluationRow, Repo, RevisitRow, TripwireContext, TripwirePatch } from '../adapters/repo';
 import { describeSpec, formatReading } from './describe';
+import { PERIOD_DAYS } from './triggers/checkin';
+import type { CheckinSpec, DateSpec, TripwireKind } from './types';
 
 export type { AdfDoc };
 
@@ -61,6 +63,14 @@ function trippedRun(evaluations: readonly EvaluationRow[]): number {
   return n;
 }
 
+const REAFFIRM_HINT: Record<TripwireKind, string> = {
+  jql_threshold: 'reaffirm with a new threshold',
+  graph_relation: 'reaffirm with a new threshold',
+  checkin: 'answer "Still true"',
+  content_change: 'accept the page changes',
+  date: 'mark the date as handled',
+};
+
 /** Description of the Revisit work item: decision, assumption, tripwire, evidence and next step. */
 export function revisitDescription(ctx: TripwireContext, evaluations: readonly EvaluationRow[], pageUrl?: string): AdfDoc {
   const { decision, assumption, tripwire } = ctx;
@@ -86,9 +96,7 @@ export function revisitDescription(ctx: TripwireContext, evaluations: readonly E
       paragraph(text(`Condition held on ${held} consecutive evaluations.`)),
       ...(history.length > 0 ? [bullets(history)] : []),
       heading('What to do'),
-      paragraph(
-        text('Open the Decision revisit panel on this work item to reaffirm with a new threshold or supersede the decision.'),
-      ),
+      paragraph(text(`Open the Decision revisit panel on this work item to ${REAFFIRM_HINT[tripwire.kind]} or supersede the decision.`)),
     ],
   };
 }
@@ -159,6 +167,9 @@ export interface ReaffirmDeps {
   jira: Pick<typeof jira, 'transitionToDone' | 'addComment'>;
   /** Whether the calling user may edit the decision page (runs as the user). */
   canEditPage: (pageId: string) => Promise<boolean>;
+  /** Current version of a watched page, the new content_change baseline; falls back to the last reading. */
+  pageVersion?: (pageId: string) => Promise<number>;
+  now?: () => Date;
 }
 
 export interface ReaffirmInput {
@@ -168,7 +179,17 @@ export interface ReaffirmInput {
 
 export type ReaffirmResult =
   | { reaffirmed: true; issueKey: string; oldThreshold: number; newThreshold: number; status: 'active'; warnings: string[] }
+  | { reaffirmed: true; issueKey: string; kind: NonNumericKind; summary: string; status: 'active'; warnings: string[] }
   | { error: string };
+
+type NonNumericKind = 'date' | 'checkin' | 'content_change';
+
+/** What Reaffirm writes for one tripwire kind; `summary` goes into the Jira comment and the panel. */
+interface ReaffirmPlan {
+  patch: TripwirePatch;
+  summary: string;
+  threshold?: { old: number; new: number };
+}
 
 /** Valid new threshold (finite number in [0, MAX_THRESHOLD]) or an error message. */
 export function parseThreshold(raw: unknown): { ok: true; value: number } | { ok: false; error: string } {
@@ -185,15 +206,71 @@ export function suggestThreshold(lastValue: number | null, current: number): num
 }
 
 // Plain text only (no mention node): who reaffirmed is in the issue history and the revisit row.
-function reaffirmComment(issueKey: string, oldThreshold: number, newThreshold: number, note: string): AdfDoc {
+function reaffirmComment(issueKey: string, summary: string, note: string): AdfDoc {
   return {
     type: 'doc',
     version: 1,
     content: [
-      paragraph(text(`Decision reaffirmed via Tripwire: threshold ${oldThreshold} → ${newThreshold}. The tripwire is active again; ${issueKey} is resolved.`)),
+      paragraph(text(`Decision reaffirmed via Tripwire: ${summary}. The tripwire is active again; ${issueKey} is resolved.`)),
       ...(note ? [paragraph(text(`Note: ${note}`))] : []),
     ],
   };
+}
+
+/**
+ * Per kind: numeric → new threshold; checkin → answered now ("Still true"); content_change → the current page
+ * version becomes the baseline; date → marked handled (one-shot, stays safe). Every plan resets strikes and
+ * clears `lastOutcome` so the UI stops showing "tripped".
+ */
+async function reaffirmPlan(ctx: TripwireContext, input: ReaffirmInput, deps: ReaffirmDeps): Promise<ReaffirmPlan | { error: string }> {
+  const { tripwire, decision } = ctx;
+  const base = { status: 'active' as const, strikes: 0, lastOutcome: null };
+  switch (tripwire.kind) {
+    case 'jql_threshold':
+    case 'graph_relation': {
+      const parsed = parseThreshold(input.newThreshold);
+      if (!parsed.ok) return { error: parsed.error };
+      const oldThreshold = (tripwire.spec as { value: number }).value;
+      const spec = { ...tripwire.spec, value: parsed.value } as TripwireContext['tripwire']['spec'];
+      // lastValue stays: it is still the latest reading.
+      return {
+        patch: { ...base, spec },
+        summary: `threshold ${oldThreshold} → ${parsed.value}`,
+        threshold: { old: oldThreshold, new: parsed.value },
+      };
+    }
+    case 'checkin': {
+      const now = (deps.now ?? (() => new Date()))();
+      const periodDays = PERIOD_DAYS[(tripwire.spec as CheckinSpec).every] ?? PERIOD_DAYS.month;
+      return {
+        patch: { ...base, confirmedAt: now.toISOString(), lastValue: periodDays },
+        summary: `the assumption is still true; the next check-in is due in ${periodDays} days`,
+      };
+    }
+    case 'content_change': {
+      let version: number | null = null;
+      if (deps.pageVersion) {
+        try {
+          version = await deps.pageVersion(decision.pageId);
+        } catch (err) {
+          console.warn('tripwire reaffirm: page version read failed, using the last reading', { pageId: decision.pageId, error: errorMessage(err) });
+        }
+      }
+      version ??= tripwire.lastValue ?? decision.pageVersion ?? null;
+      if (version === null || !Number.isInteger(version)) return { error: 'Could not read the current page version; try again in a minute.' };
+      return {
+        patch: { ...base, baselineVersion: version, lastValue: version },
+        summary: `the page edits up to version ${version} keep the decision valid; later edits trip the tripwire again`,
+      };
+    }
+    case 'date': {
+      const spec = tripwire.spec as DateSpec;
+      return {
+        patch: { ...base, spec: { ...spec, resolved: true } },
+        summary: `the ${spec.date} milestone was handled; this one-shot date tripwire stays safe from now on`,
+      };
+    }
+  }
 }
 
 const ALREADY_RESOLVED = 'already resolved';
@@ -210,10 +287,11 @@ function closedMessage(revisit: RevisitRow): string {
 }
 
 /**
- * Reaffirm from the Revisit issue panel: the decision stands, the assumption gets a new threshold. Only people
- * who can edit the decision page may reaffirm. The `revisiting → active` CAS and the conditional revisit close
- * each have a single winner, so double clicks resolve once. The Jira transition and comment are best effort: a
- * failure there is reported as a warning and never undoes the SQL change.
+ * Reaffirm from the Revisit issue panel: the decision stands. Numeric tripwires get a new threshold, the others
+ * are reset per kind (see `reaffirmPlan`). Only people who can edit the decision page may reaffirm. The
+ * `revisiting → active` CAS and the conditional revisit close each have a single winner, so double clicks
+ * resolve once. The Jira transition and comment are best effort: a failure there is reported as a warning and
+ * never undoes the SQL change.
  */
 export async function reaffirmRevisit(issueKey: string, accountId: string, input: ReaffirmInput, deps: ReaffirmDeps): Promise<ReaffirmResult> {
   const { repo } = deps;
@@ -226,19 +304,16 @@ export async function reaffirmRevisit(issueKey: string, accountId: string, input
   if (!(await deps.canEditPage(decision.pageId))) {
     return { error: 'Only people who can edit the decision page can reaffirm it.' };
   }
-  if (tripwire.kind !== 'jql_threshold' && tripwire.kind !== 'graph_relation') {
-    return { error: 'Reaffirm with a new threshold only works for numeric tripwires.' };
+  if (!['revisiting', 'tripped', 'active', 'near'].includes(tripwire.status)) {
+    return { error: `This tripwire is ${tripwire.status}; only a tripped tripwire under revisit can be reaffirmed.` };
   }
-  const parsed = parseThreshold(input.newThreshold);
-  if (!parsed.ok) return { error: parsed.error };
+  const plan = await reaffirmPlan(ctx, input, deps);
+  if ('error' in plan) return plan;
   const note = typeof input.note === 'string' ? cut(input.note.replace(/\s+/g, ' ').trim(), NOTE_MAX) : '';
 
-  const spec = tripwire.spec as { value: number };
-  const oldThreshold = spec.value;
-  const newSpec = { ...tripwire.spec, value: parsed.value } as TripwireContext['tripwire']['spec'];
-  // lastValue stays (it is still the latest reading); lastOutcome is cleared so the UI stops showing "tripped".
-  const patch = { status: 'active' as const, strikes: 0, spec: newSpec, lastOutcome: null };
-  const close = () => repo.closeRevisit(revisit.id, { outcome: 'reaffirm', resolvedBy: accountId, newThreshold: parsed.value });
+  const { patch } = plan;
+  const close = () =>
+    repo.closeRevisit(revisit.id, { outcome: 'reaffirm', resolvedBy: accountId, ...(plan.threshold ? { newThreshold: plan.threshold.new } : {}) });
   const warnings: string[] = [];
 
   if (tripwire.status === 'revisiting' || tripwire.status === 'tripped') {
@@ -246,7 +321,15 @@ export async function reaffirmRevisit(issueKey: string, accountId: string, input
     // An active tripwire next to an open revisit would block every later Revisit: put the tripwire back.
     const rollback = () =>
       repo
-        .casTripwire(tripwire.id, ['active'], { status: tripwire.status, strikes: tripwire.strikes, spec: tripwire.spec, lastOutcome: tripwire.lastOutcome })
+        .casTripwire(tripwire.id, ['active'], {
+          status: tripwire.status,
+          strikes: tripwire.strikes,
+          spec: tripwire.spec,
+          lastOutcome: tripwire.lastOutcome,
+          lastValue: tripwire.lastValue,
+          confirmedAt: tripwire.confirmedAt,
+          baselineVersion: tripwire.baselineVersion,
+        })
         .catch((rollbackErr: unknown) => {
           console.error('tripwire reaffirm: rollback failed', { issueKey, error: errorMessage(rollbackErr) });
           return false;
@@ -267,10 +350,12 @@ export async function reaffirmRevisit(issueKey: string, accountId: string, input
     // the threshold, so the decision is not left with an open revisit nobody can resolve.
     if (!(await close())) return { error: ALREADY_RESOLVED };
     if (!(await repo.casTripwire(tripwire.id, [tripwire.status], patch))) {
-      warnings.push('The tripwire changed while reaffirming; the new threshold was not applied. Check it on the decision page.');
+      warnings.push(
+        plan.threshold
+          ? 'The tripwire changed while reaffirming; the new threshold was not applied. Check it on the decision page.'
+          : 'The tripwire changed while reaffirming; it was not reset. Check it on the decision page.',
+      );
     }
-  } else {
-    return { error: `This tripwire is ${tripwire.status}; only a tripped tripwire under revisit can be reaffirmed.` };
   }
 
   try {
@@ -281,13 +366,22 @@ export async function reaffirmRevisit(issueKey: string, accountId: string, input
     warnings.push(`Could not move ${issueKey} to Done: ${errorMessage(err)}`);
   }
   try {
-    await deps.jira.addComment(issueKey, reaffirmComment(issueKey, oldThreshold, parsed.value, note));
+    await deps.jira.addComment(issueKey, reaffirmComment(issueKey, plan.summary, note));
   } catch (err) {
     console.warn('tripwire reaffirm: comment failed', { issueKey, error: errorMessage(err) });
     warnings.push(`Could not comment on ${issueKey}: ${errorMessage(err)}`);
   }
-  console.info('tripwire reaffirmed', { issueKey, tripwireId: tripwire.id, oldThreshold, newThreshold: parsed.value, warnings: warnings.length });
-  return { reaffirmed: true, issueKey, oldThreshold, newThreshold: parsed.value, status: 'active', warnings };
+  console.info('tripwire reaffirmed', {
+    issueKey,
+    tripwireId: tripwire.id,
+    kind: tripwire.kind,
+    ...(plan.threshold ? { oldThreshold: plan.threshold.old, newThreshold: plan.threshold.new } : {}),
+    warnings: warnings.length,
+  });
+  if (plan.threshold) {
+    return { reaffirmed: true, issueKey, oldThreshold: plan.threshold.old, newThreshold: plan.threshold.new, status: 'active', warnings };
+  }
+  return { reaffirmed: true, issueKey, kind: tripwire.kind as NonNumericKind, summary: plan.summary, status: 'active', warnings };
 }
 
 async function openLocked(ctx: TripwireContext, deps: RevisitDeps, rollback: () => Promise<void>): Promise<OpenRevisitResult> {

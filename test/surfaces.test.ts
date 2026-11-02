@@ -43,7 +43,7 @@ vi.mock('../src/adapters/sql', () => ({
   execute: vi.fn(),
 }));
 vi.mock('../src/adapters/confluence', () => ({
-  confluence: { canEditPage: forge.canEditPage, getPage: vi.fn(), viewPageAsUser: forge.viewPageAsUser },
+  confluence: { canEditPage: forge.canEditPage, getPage: vi.fn(), viewPageAsUser: forge.viewPageAsUser, getPageLabels: async () => [] },
 }));
 vi.mock('../src/adapters/repo', async (importActual) => ({
   ...(await importActual<typeof import('../src/adapters/repo')>()),
@@ -59,7 +59,7 @@ vi.mock('../src/core/evaluator', async (importActual) => ({
 const { fakeRepo } = await import('./helpers/fakeRepo');
 const { seedTripwire } = await import('./helpers/seed');
 const { EvaluationRateLimitedError } = await import('../src/core/evaluator');
-const { evaluateBatch, MAX_EVALUATE_ATTEMPTS, retryLater } = await import('../src/surfaces/background');
+const { evaluateBatch, MAX_EVALUATE_ATTEMPTS, onPageEvent, retryLater } = await import('../src/surfaces/background');
 await import('../src/surfaces/ui');
 
 let repo: FakeRepo;
@@ -83,6 +83,27 @@ beforeEach(() => {
   forge.canEditPage.mockReset().mockResolvedValue(true);
   forge.viewPageAsUser.mockReset().mockResolvedValue({ title: 'Defer CSV export', webUrl: 'https://site/wiki/pages/1' });
   forge.evaluateMany.mockReset();
+});
+
+describe('onPageEvent: content_change', () => {
+  it('queues an evaluation of the page’s confirmed content_change tripwires only', async () => {
+    const watched = seedTripwire(repo);
+    const pageId = repo.decisions.get(watched.decisionId)!.pageId;
+    repo.tripwires.set(watched.tripwireId, { ...repo.tripwires.get(watched.tripwireId)!, kind: 'content_change', spec: { pageId, watch: 'any_edit' }, baselineVersion: 3 });
+    seedTripwire(repo, { decisionId: watched.decisionId }); // jql_threshold on the same page: not queued
+    const proposed = seedTripwire(repo, { decisionId: watched.decisionId, status: 'proposed' });
+    repo.tripwires.set(proposed.tripwireId, { ...repo.tripwires.get(proposed.tripwireId)!, kind: 'content_change', spec: { pageId, watch: 'any_edit' } });
+
+    await onPageEvent({ eventType: 'avi:confluence:updated:page', content: { id: pageId } });
+
+    expect(forge.push).toHaveBeenCalledTimes(1);
+    expect(forge.push).toHaveBeenCalledWith([{ body: { tripwireIds: [watched.tripwireId], attempt: 1 } }]);
+  });
+
+  it('queues nothing for a page without a decision', async () => {
+    await onPageEvent({ eventType: 'avi:confluence:updated:page', content: { id: '424242' } });
+    expect(forge.push).not.toHaveBeenCalled();
+  });
 });
 
 describe('scanPage (S2)', () => {

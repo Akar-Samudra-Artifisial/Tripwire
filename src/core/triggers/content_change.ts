@@ -13,10 +13,21 @@ export function validate(spec: unknown): ValidationResult<ContentChangeSpec> {
 
 /**
  * Compares the watched page's current version with the version seen when the tripwire was confirmed.
- * Normally evaluated from the page-updated event; `baselineVersion` comes from the stored tripwire.
+ * Evaluated daily and right after the page-updated event; `baselineVersion` comes from the stored tripwire.
+ * Without a baseline the reading is safe and the evaluator stores the current version as the baseline.
  */
 export async function evaluate(spec: ContentChangeSpec, baselineVersion?: number): Promise<TriggerReading> {
   const version = await confluence.getPageVersion(spec.pageId);
-  const changed = baselineVersion !== undefined && version > baselineVersion;
-  return { value: version, outcome: changed ? 'tripped' : 'safe', detail: `page version ${version}` };
+  return contentChangeReading(version, baselineVersion);
+}
+
+/** Pure part of `evaluate`: tripped once the page version moved past the baseline. */
+export function contentChangeReading(version: number, baselineVersion?: number): TriggerReading {
+  if (baselineVersion === undefined) return { value: version, outcome: 'safe', detail: `page version ${version}, baseline set now` };
+  const changed = version > baselineVersion;
+  return {
+    value: version,
+    outcome: changed ? 'tripped' : 'safe',
+    detail: changed ? `page edited: version ${version}, baseline ${baselineVersion}` : `page version ${version}, unchanged`,
+  };
 }

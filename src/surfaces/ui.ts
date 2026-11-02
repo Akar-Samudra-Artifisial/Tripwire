@@ -342,6 +342,7 @@ resolver.define('reaffirmRevisit', async ({ payload, context }) => {
       repo: sqlRepo,
       jira,
       canEditPage: (pageId) => confluence.canEditPage(pageId),
+      pageVersion: (pageId) => confluence.getPageVersion(pageId),
     });
   } catch (err) {
     if (err instanceof Error && isForgePlatformError(err)) throw err;
