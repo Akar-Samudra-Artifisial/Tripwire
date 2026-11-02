@@ -13,6 +13,7 @@ const forge = vi.hoisted(() => ({
   findSpace: vi.fn<(key: string) => Promise<{ id: string; key: string } | undefined>>(),
   canAdministerSpace: vi.fn<(spaceId: string) => Promise<boolean>>(),
   repo: { current: undefined as unknown },
+  ensureSchema: vi.fn<() => Promise<void>>(),
 }));
 
 vi.mock('@forge/resolver', () => ({
@@ -41,7 +42,7 @@ vi.mock('@forge/api', () => ({
 }));
 vi.mock('@forge/llm', () => ({ chat: vi.fn(), ForgeLlmError: class extends Error {} }));
 vi.mock('../src/adapters/sql', () => ({
-  ensureSchema: async () => undefined,
+  ensureSchema: forge.ensureSchema,
   listAppliedMigrations: async () => [],
   query: vi.fn(),
   execute: vi.fn(),
@@ -100,6 +101,7 @@ beforeEach(() => {
   repo.settings = { ...repo.settings, revisitProjectKey: 'SUP', allowedProjectKeys: ['SUP'] };
   forge.repo.current = repo;
   forge.push.mockReset().mockResolvedValue({ jobId: 'job-1' });
+  forge.ensureSchema.mockReset().mockResolvedValue(undefined);
   forge.canEditPage.mockReset().mockResolvedValue(true);
   forge.viewPageAsUser.mockReset().mockResolvedValue({ title: 'Defer CSV export', webUrl: 'https://site/wiki/pages/1' });
   forge.evaluateMany.mockReset();
@@ -394,5 +396,93 @@ describe('Radar resolvers', () => {
     forge.viewPageAsUser.mockResolvedValue(undefined);
     expect(await health('radarGraphContext', { pairId })).toEqual({ error: 'This Radar pair no longer exists.' });
     expect(forge.fetchPairGraph).not.toHaveBeenCalled();
+  });
+});
+
+const { SchemaSettingUpError } = await import('../src/core/schema');
+
+describe('new install: database still being set up', () => {
+  const admin = (name: string) =>
+    forge.defs.get(name)!({ context: { moduleKey: 'tripwire-setup', accountId: 'admin-1' } }) as Promise<Record<string, unknown>>;
+
+  it('initialise reports progress instead of failing', async () => {
+    forge.ensureSchema.mockRejectedValue(new SchemaSettingUpError(12, 30));
+    expect(await admin('initialise')).toMatchObject({ settingUp: true, applied: 12, total: 30 });
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it('other resolvers return a readable setting-up message, not "failed"', async () => {
+    forge.ensureSchema.mockRejectedValue(new SchemaSettingUpError(12, 30));
+    const settings = await admin('getSettings');
+    expect(settings).toMatchObject({ settingUp: true });
+    expect(settings.error).toContain('setting up its database (12/30 steps)');
+    expect(await call('getDecision', '1')).toMatchObject({ settingUp: true });
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it('queue consumers retry later instead of failing', async () => {
+    forge.ensureSchema.mockRejectedValue(new SchemaSettingUpError(12, 30));
+    const result = await evaluateBatch({ body: { tripwireIds: ['t1'] } });
+    expect(result).toMatchObject({ options: { retryAfter: 60 } });
+    expect(forge.evaluateMany).not.toHaveBeenCalled();
+  });
+});
+
+const { demoJob, demoSeedDeps, seedDeps } = await import('../src/surfaces/background');
+const { DEMO_JOB_KEY, DEMO_JOB_LOCK } = await import('../src/surfaces/demoJob');
+
+describe('demo buttons: queued job + polling', () => {
+  const admin = (name: string) =>
+    forge.defs.get(name)!({ context: { moduleKey: 'tripwire-setup', accountId: 'admin-1' } }) as Promise<Record<string, unknown>>;
+
+  it('Load returns a queued job at once and pushes it to the demo queue (no seeding in the resolver)', async () => {
+    const reply = (await admin('loadDemoData')) as { job: { id: string; kind: string; status: string }; started: boolean };
+    expect(reply).toMatchObject({ started: true, job: { kind: 'load', status: 'queued' } });
+    expect(forge.push).toHaveBeenCalledTimes(1);
+    expect(forge.push).toHaveBeenCalledWith({ body: { jobId: reply.job.id } });
+    expect(reply.job).not.toHaveProperty('accountId');
+    expect(repo.appLocks.has(DEMO_JOB_LOCK)).toBe(true);
+  });
+
+  it('a double click (or another demo button) returns the running job instead of an error', async () => {
+    const first = (await admin('loadDemoData')) as { job: { id: string } };
+    const again = (await admin('loadDemoData')) as { job: { id: string }; started: boolean };
+    const other = (await admin('simulateBusyMonth')) as { job: { id: string; kind: string }; started: boolean };
+    expect(again).toMatchObject({ started: false, job: { id: first.job.id } });
+    expect(other).toMatchObject({ started: false, job: { id: first.job.id, kind: 'load' } });
+    expect(forge.push).toHaveBeenCalledTimes(1);
+  });
+
+  it('Simulate checks page access as the admin in the resolver, for the consumer', async () => {
+    repo.appValues.set('demo', { pageId: '501', pages: { 'csv-export': '501', 'go-services': '502' } });
+    forge.canEditPage.mockImplementation(async (id) => id === '501');
+    await admin('simulateBusyMonth');
+    expect(repo.appValues.get(DEMO_JOB_KEY)).toMatchObject({ kind: 'simulate', accountId: 'admin-1', editablePageIds: ['501'], checkedPageIds: ['501', '502'] });
+  });
+
+  it('getDemoJob is admin-only and hides the account id', async () => {
+    await admin('loadDemoData');
+    const polled = (await admin('getDemoJob')) as { job: Record<string, unknown> };
+    expect(polled.job).toMatchObject({ kind: 'load', status: 'queued' });
+    expect(polled.job).not.toHaveProperty('accountId');
+    expect(polled.job).not.toHaveProperty('editablePageIds');
+    forge.isAdmin.mockResolvedValue(false);
+    expect(await admin('getDemoJob')).toEqual({ error: 'Only Jira administrators can read demo job.' });
+  });
+
+  it('the consumer records a SeedError as a failed job with its message and frees the lock', async () => {
+    const { job } = (await admin('simulateBusyMonth')) as { job: { id: string } };
+    await demoJob({ body: { jobId: job.id } });
+    const polled = (await admin('getDemoJob')) as { job: Record<string, unknown> };
+    expect(polled.job).toMatchObject({ id: job.id, status: 'failed', error: 'Run "Load demo data" first.' });
+    expect(repo.appLocks.has(DEMO_JOB_LOCK)).toBe(false);
+  });
+
+  it('consumer page access comes from the resolver check (no asUser in a queue consumer)', async () => {
+    const deps = demoSeedDeps(seedDeps, { editablePageIds: ['1'], checkedPageIds: ['1', '2'] }, async () => undefined);
+    expect(await deps.confluence.canEditPage('1')).toBe(true);
+    expect(await deps.confluence.canEditPage('2')).toBe(false);
+    await expect(deps.confluence.canEditPage('3')).rejects.toThrow(/not checked/);
+    expect(deps.limits?.budgetMs).toBeGreaterThan(60_000);
   });
 });

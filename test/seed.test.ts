@@ -822,3 +822,77 @@ describe('resetDemo', () => {
     await expect(resetDemo(ACCOUNT, deps)).rejects.toThrow(BUSY_MESSAGE);
   });
 });
+
+const { startDemoJob, runDemoJob, readDemoJob } = await import('../src/surfaces/demoJob');
+const { LOAD_STEPS, SIMULATE_STEPS } = await import('../src/adapters/seed');
+
+describe('background demo job (one click, runs in the demo-seed consumer)', () => {
+  const LIMITS = { budgetMs: 12 * 60_000, indexWaitMs: 3 * 60_000, lockSeconds: 900 };
+
+  /** Starts a job and runs it the way the consumer does, with long limits and progress recorded. */
+  async function oneClick(kind: 'load' | 'simulate', seed: SeedDeps) {
+    let ids = 0;
+    const jobDeps = { repo, push: vi.fn(async () => undefined), now: seed.now, newId: () => `job-${++ids}` };
+    const started = await startDemoJob(kind, ACCOUNT, async () => ({ editable: [], checked: [] }), jobDeps);
+    if (!('job' in started)) throw new Error(started.error);
+    const steps: string[] = [];
+    await runDemoJob(started.job.id, {
+      repo,
+      now: seed.now,
+      userMessage: (e) => (e instanceof SeedError ? e.message : undefined),
+      run: (job, progress) => {
+        const withProgress: SeedDeps = {
+          ...seed,
+          limits: LIMITS,
+          progress: async (s, t, m) => {
+            steps.push(`${s}/${t} ${m}`);
+            await progress(s, t, m);
+          },
+        };
+        return kind === 'load' ? loadDemoData(job.accountId, withProgress) : simulateBusyMonth(withProgress, job.accountId);
+      },
+    });
+    return { job: await readDemoJob(jobDeps), steps };
+  }
+
+  it('Load creates every page in one job, with progress per step, even when Jira and Confluence are slow', async () => {
+    const { deps, confluence } = makeDeps({ project: false, tickets: 0 }, repo);
+    // Each page takes 4 s: the old 18 s resolver budget stopped after a few pages.
+    const create = confluence.createPage.getMockImplementation()!;
+    confluence.createPage.mockImplementation(async (space: string, title: string, storage: string) => {
+      await deps.sleep(4000);
+      return create(space, title, storage);
+    });
+    const { job, steps } = await oneClick('load', deps);
+    expect(job).toMatchObject({ status: 'done', step: LOAD_STEPS, total: LOAD_STEPS });
+    expect(job?.result).toMatchObject({ complete: true, created: { pages: DEMO_PAGES.length } });
+    expect(steps[0]).toMatch(/^1\/10 /);
+    expect(steps).toHaveLength(LOAD_STEPS);
+    // The cooldown after a successful Load stays at 60 s, not the job's long lock.
+    expect(Date.parse(repo.appLocks.get(LOAD_LOCK)!)).toBe(NOW + 4000 * DEMO_PAGES.length + 60_000);
+  });
+
+  it('Simulate finishes both passes and opens the Revisit in one job although Jira search lags 60 s', async () => {
+    const { decisionId, tripwireId } = demoTripwire(repo);
+    let pass = 0;
+    const evaluate = vi.fn(async (ids: readonly string[]) => {
+      pass += 1;
+      if (pass === 2) await repo.insertRevisit({ id: 'rv-1', decisionId, issueKey: 'SUP-99', tripwireId: ids[0], status: 'open' });
+      return { results: ids.map((id) => ({ status: 'evaluated' as const, tripwireId: id, outcome: 'tripped' as const, value: 37, newStatus: pass === 1 ? ('active' as const) : ('tripped' as const), revisitRequested: pass === 2 })), rateLimited: false };
+    });
+    const { deps, jira } = makeDeps({ project: true, tickets: 7, billing: 2 }, repo, evaluate);
+    const real = jira.countIssues.getMockImplementation()!;
+    jira.countIssues.mockImplementation(async (jql: string) => (deps.now() < NOW + 60_000 ? (labelOf(jql) === 'export' ? 7 : 2) : real(jql)));
+    const { job, steps } = await oneClick('simulate', deps);
+    expect(job).toMatchObject({ status: 'done', total: SIMULATE_STEPS });
+    expect(job?.result).toMatchObject({ indexed: true, complete: true, revisits: [{ tripwireId, issueKey: 'SUP-99' }] });
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    expect(steps.map((s) => s.slice(0, 3))).toEqual(['1/5', '2/5', '3/5', '4/5', '5/5']);
+  });
+
+  it('a Simulate SeedError ends the job as failed with the message, ready for another click', async () => {
+    const { deps } = makeDeps({ project: true, tickets: 7 }, repo);
+    const { job } = await oneClick('simulate', deps);
+    expect(job).toMatchObject({ status: 'failed', error: 'Run "Load demo data" first.' });
+  });
+});

@@ -2,6 +2,7 @@
 import { confluence } from '../adapters/confluence';
 import { sqlRepo, type Repo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
+import { SchemaSettingUpError } from '../core/schema';
 import type { TripwireStatus } from '../core/types';
 
 export interface ListTrippedPayload {
@@ -175,6 +176,7 @@ export async function listTripped(payload: ListTrippedPayload): Promise<ListTrip
     await ensureSchema();
     return await listTrippedWith(payload ?? {}, { repo: sqlRepo, viewPage: (pageId) => confluence.viewPageAsUser(pageId) });
   } catch (err) {
+    if (err instanceof SchemaSettingUpError) return { error: err.message };
     console.error('tripwire list-tripped failed', err);
     return { error: LIST_FAILED };
   }

@@ -1,40 +1,60 @@
+import { Queue } from '@forge/events';
 import { migrationRunner, sql } from '@forge/sql';
 import { MIGRATIONS } from '../core/migrations';
+import { isSqlRateLimited, migrateWithPacing, schemaGuard, schemaStatus, type MigrationStore } from '../core/schema';
 
-/** Applies pending migrations; the runner records applied names, so this is safe to call repeatedly. */
-export async function runMigrations(): Promise<string[]> {
-  const runner = MIGRATIONS.reduce((r, m) => r.enqueue(m.name, m.statement), migrationRunner);
-  return runner.run();
+export const MIGRATE_QUEUE = 'schema-migrate';
+const migrateQueue = new Queue({ key: MIGRATE_QUEUE });
+
+/** Forge SQL migration history (the table `@forge/sql`'s `migrationRunner` uses). Reads go through the DML endpoint. */
+const store: MigrationStore = {
+  async applied() {
+    try {
+      const result = await sql.prepare<{ name: string }>('SELECT name FROM __migrations').execute();
+      return (result.rows as { name: string }[]).map((r) => r.name);
+    } catch (err) {
+      // A new install has no history table yet; the migration run creates it. Errors other than "missing" surface
+      // there too (the run would fail on its first statement).
+      if (isSqlRateLimited(err)) throw err;
+      return undefined;
+    }
+  },
+  createHistory: () => migrationRunner.initialize(),
+  ddl: async (statement) => {
+    await sql.executeDDL(statement);
+  },
+  record: async (name) => {
+    await sql.prepare('INSERT INTO __migrations (name) VALUES (?)').bindParams(name).execute();
+  },
+};
+
+/** Queues a migration run on the `schema-migrate` consumer (the only place that runs DDL). */
+export async function requestMigration(reason: string): Promise<string> {
+  const { jobId } = await migrateQueue.push({ body: { reason } });
+  return jobId;
 }
 
 /**
- * Memoised migration runner. The memo is per isolate, so another invocation may be migrating at the same time:
- * on failure run once more (the runner skips names it already recorded, and every ALTER is IF NOT EXISTS).
- * A second failure clears the memo so the next call tries again.
+ * Applies pending migrations, waiting out the DDL rate limit, for up to `budgetMs`. Only for the `schema-migrate`
+ * consumer (900 s timeout).
  */
-export function schemaGuard(migrate: () => Promise<string[]>): () => Promise<void> {
-  let ready: Promise<string[]> | undefined;
-  return async () => {
-    ready ??= migrate()
-      .catch((err: unknown) => {
-        console.warn('tripwire migrations failed, retrying once', { error: err instanceof Error ? err.message : String(err) });
-        return migrate();
-      })
-      .catch((err: unknown) => {
-        ready = undefined;
-        throw err;
-      });
-    await ready;
-  };
+export function runMigrations(budgetMs: number) {
+  return migrateWithPacing(store, MIGRATIONS, {
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    now: Date.now,
+    deadline: Date.now() + budgetMs,
+  });
 }
 
-/** Runs migrations once per warm invocation; call before any code that touches SQL. */
-export const ensureSchema = schemaGuard(runMigrations);
+/**
+ * Call before any code that touches SQL. Never runs DDL: while migrations are pending it queues a migration run and
+ * throws `SchemaSettingUpError` (callers show "setting up" or retry later).
+ */
+export const ensureSchema = schemaGuard(() => schemaStatus(store, MIGRATIONS), () => requestMigration('pending'));
 
 /** Applied migration names, oldest first. Deduped: concurrent runs can record the same name twice. */
 export async function listAppliedMigrations(): Promise<string[]> {
-  const versions = await migrationRunner.list();
-  return [...new Set(versions.map((v) => v.name))];
+  return [...new Set((await store.applied()) ?? [])];
 }
 
 /** Parameterised SELECT; never interpolate values into `query`. */
