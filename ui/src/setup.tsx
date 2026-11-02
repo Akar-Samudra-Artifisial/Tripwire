@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { call } from './bridge';
 import { mount } from './mount';
 import { Shell } from './components';
@@ -28,14 +28,43 @@ const toForm = (s: Settings): Form => ({
 
 const toList = (value: string) => value.split(',').map((s) => s.trim()).filter(Boolean);
 
-function Initialise() {
-  const [state, setState] = useState<{ busy: boolean; latest?: string; count?: number; error?: string }>({ busy: false });
+interface InitialiseReply {
+  applied: string[] | number;
+  total: number;
+  latest: string;
+  settingUp?: boolean;
+}
+
+/** While a new install is still migrating, check again after this delay. */
+const SETUP_POLL_MS = 15_000;
+
+/** Checks the schema on open and while it is being set up; `onReady` fires when it becomes complete. */
+function Initialise({ onReady }: { onReady: () => void }) {
+  const [state, setState] = useState<{ busy: boolean; latest?: string; count?: number; progress?: string; error?: string }>({ busy: false });
+  const [poll, setPoll] = useState(0);
+  const settingUp = useRef(false);
   const run = () => {
-    setState({ busy: true });
-    call<{ applied: string[]; latest: string }>('initialise')
-      .then((r) => setState({ busy: false, latest: r.latest, count: r.applied.length }))
+    setState((s) => ({ busy: true, progress: s.progress }));
+    call<InitialiseReply>('initialise')
+      .then((r) => {
+        if (r.settingUp) {
+          settingUp.current = true;
+          setState({ busy: false, progress: `Setting up the database… ${String(r.applied)}/${r.total} steps. Checking again in a few seconds.` });
+          setTimeout(() => setPoll((n) => n + 1), SETUP_POLL_MS);
+        } else {
+          // Replaces the progress line, so no stale "setting up" message stays behind.
+          setState({ busy: false, latest: r.latest, count: Array.isArray(r.applied) ? r.applied.length : r.applied });
+          if (settingUp.current) {
+            settingUp.current = false;
+            onReady();
+          }
+        }
+      })
       .catch((e: unknown) => setState({ busy: false, error: message(e) }));
   };
+  useEffect(() => {
+    run();
+  }, [poll]);
   return (
     <section className="setup__section">
       <h2 className="setup__heading">Database</h2>
@@ -43,6 +72,7 @@ function Initialise() {
       <button type="button" className="setup__button" onClick={run} disabled={state.busy}>
         {state.busy ? 'Initialising…' : 'Initialise'}
       </button>
+      {state.progress && !state.latest && <p role="status">{state.progress}</p>}
       {state.latest && (
         <p role="status">
           Schema up to date: latest = <code>{state.latest}</code> ({state.count} migrations applied)
@@ -57,19 +87,24 @@ function Initialise() {
   );
 }
 
-function SettingsForm() {
+/** `ready` changes when the database finished setting up: the settings are loaded again (clearing a "setting up" error). */
+function SettingsForm({ ready }: { ready: number }) {
   const [form, setForm] = useState<Form | undefined>();
   const [status, setStatus] = useState<{ busy: boolean; saved?: boolean; error?: string }>({ busy: false });
 
   useEffect(() => {
     let alive = true;
     call<Settings>('getSettings')
-      .then((s) => alive && setForm(toForm(s)))
+      .then((s) => {
+        if (!alive) return;
+        setForm(toForm(s));
+        setStatus((st) => (st.busy ? st : { busy: false }));
+      })
       .catch((e: unknown) => alive && setStatus({ busy: false, error: message(e) }));
     return () => {
       alive = false;
     };
-  }, []);
+  }, [ready]);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -252,25 +287,64 @@ interface ResetDemoResult {
   warnings: string[];
 }
 
-function ResetDemo({ disabled, onBusy }: { disabled: boolean; onBusy: (busy: boolean) => void }) {
-  const [state, setState] = useState<{ busy: boolean; confirming: boolean; result?: ResetDemoResult; error?: string }>({
-    busy: false,
-    confirming: false,
-  });
+type DemoJobKind = 'load' | 'simulate' | 'reset';
+
+/** A demo job as returned by `loadDemoData` / `simulateBusyMonth` / `resetDemo` / `getDemoJob`. */
+interface DemoJob {
+  id: string;
+  kind: DemoJobKind;
+  status: 'queued' | 'running' | 'done' | 'failed';
+  step: number;
+  total: number;
+  message: string;
+  result?: unknown;
+  error?: string;
+}
+
+/** How often the page checks a running demo job. */
+const DEMO_POLL_MS = 4000;
+
+const RESOLVERS: Record<DemoJobKind, string> = { load: 'loadDemoData', simulate: 'simulateBusyMonth', reset: 'resetDemo' };
+const RUNNING: Record<DemoJobKind, string> = { load: 'Loading demo data', simulate: 'Simulating a busy month', reset: 'Resetting the demo' };
+
+const isActive = (job: DemoJob | undefined) => job?.status === 'queued' || job?.status === 'running';
+
+/** Progress line of a running job, e.g. "Loading demo data… step 3/10: Decision page 1 of 8". */
+function JobProgress({ job }: { job: DemoJob | undefined }) {
+  if (!job || !isActive(job)) return null;
+  return (
+    <p role="status">
+      {RUNNING[job.kind]}… {job.step > 0 ? `step ${job.step}/${job.total}: ${job.message}` : 'queued, starting in a few seconds'}
+    </p>
+  );
+}
+
+/** Error of a failed job, or of a click that could not start one. */
+function JobError({ job, error }: { job: DemoJob | undefined; error: string | undefined }) {
+  const text = error ?? (job?.status === 'failed' ? (job.error ?? 'The demo job failed. Check the app logs.') : undefined);
+  if (!text) return null;
+  return (
+    <p className="error" role="alert">
+      {text}
+    </p>
+  );
+}
+
+/** Result of a job that finished. */
+const doneResult = <T,>(job: DemoJob | undefined): T | undefined => (job?.status === 'done' ? (job.result as T | undefined) : undefined);
+
+function ResetDemo({ job, error, disabled, onRun }: { job: DemoJob | undefined; error?: string; disabled: boolean; onRun: () => void }) {
+  const [confirming, setConfirming] = useState(false);
   const run = () => {
     // Two clicks instead of window.confirm: modals are not available in the Custom UI iframe.
-    if (!state.confirming) {
-      setState({ busy: false, confirming: true });
+    if (!confirming) {
+      setConfirming(true);
       return;
     }
-    setState({ busy: true, confirming: false });
-    onBusy(true);
-    call<ResetDemoResult>('resetDemo')
-      .then((result) => setState({ busy: false, confirming: false, result }))
-      .catch((e: unknown) => setState({ busy: false, confirming: false, error: message(e) }))
-      .finally(() => onBusy(false));
+    setConfirming(false);
+    onRun();
   };
-  const r = state.result;
+  const r = doneResult<ResetDemoResult>(job);
   return (
     <>
       <p className="muted">
@@ -280,15 +354,16 @@ function ResetDemo({ disabled, onBusy }: { disabled: boolean; onBusy: (busy: boo
         outside the demo is touched.
       </p>
       <div className="assumption__actions">
-        <button type="button" className="setup__button" onClick={run} disabled={disabled || state.busy}>
-          {state.busy ? 'Resetting…' : state.confirming ? 'Click again to reset the demo' : 'Reset demo'}
+        <button type="button" className="setup__button" onClick={run} disabled={disabled}>
+          {isActive(job) ? 'Resetting…' : confirming ? 'Click again to reset the demo' : 'Reset demo'}
         </button>
-        {state.confirming && (
-          <button type="button" className="setup__button" onClick={() => setState({ busy: false, confirming: false })}>
+        {confirming && (
+          <button type="button" className="setup__button" onClick={() => setConfirming(false)}>
             Cancel
           </button>
         )}
       </div>
+      <JobProgress job={job} />
       {r && (
         <p role="status">
           {r.complete ? 'Demo reset' : `Not finished: ${r.message ?? 'click Reset demo again'}`} · {r.relabelled} busy month tickets
@@ -305,34 +380,59 @@ function ResetDemo({ disabled, onBusy }: { disabled: boolean; onBusy: (busy: boo
           {w}
         </p>
       ))}
-      {state.error && (
-        <p className="error" role="alert">
-          {state.error}
-        </p>
-      )}
+      <JobError job={job} error={error} />
     </>
   );
 }
 
-function DemoData() {
-  const [load, setLoad] = useState<{ busy: boolean; result?: LoadDemoResult; error?: string }>({ busy: false });
-  const [sim, setSim] = useState<{ busy: boolean; result?: SimulateResult; error?: string }>({ busy: false });
-  const [resetting, setResetting] = useState(false);
-  const runLoad = () => {
-    setLoad({ busy: true });
-    call<LoadDemoResult>('loadDemoData')
-      .then((result) => setLoad({ busy: false, result }))
-      .catch((e: unknown) => setLoad({ busy: false, error: message(e) }));
+/**
+ * The demo buttons queue a background job and return at once; the page shows its progress and polls until it is
+ * done. A job still running when the page is opened again is picked up the same way.
+ */
+function DemoData({ ready }: { ready: number }) {
+  const [jobs, setJobs] = useState<Partial<Record<DemoJobKind, DemoJob>>>({});
+  const [errors, setErrors] = useState<Partial<Record<DemoJobKind, string>>>({});
+  const [starting, setStarting] = useState<DemoJobKind | undefined>();
+  const [retry, setRetry] = useState(0);
+  const remember = (job: DemoJob | null | undefined) => {
+    if (job) setJobs((prev) => ({ ...prev, [job.kind]: job }));
   };
-  const runSim = () => {
-    setSim({ busy: true });
-    call<SimulateResult>('simulateBusyMonth')
-      .then((result) => setSim({ busy: false, result }))
-      .catch((e: unknown) => setSim({ busy: false, error: message(e) }));
+
+  // On open (and once the database is ready): a job may still be running from an earlier visit.
+  useEffect(() => {
+    let alive = true;
+    call<{ job: DemoJob | null }>('getDemoJob')
+      .then((r) => alive && remember(r.job))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [ready]);
+
+  const active = Object.values(jobs).find((j) => isActive(j));
+  useEffect(() => {
+    if (!active) return;
+    const timer = setTimeout(() => {
+      call<{ job: DemoJob | null }>('getDemoJob')
+        .then((r) => remember(r.job ?? { ...active, status: 'failed', error: 'The demo job disappeared. Click the button again.' }))
+        // A failed poll (network, timeout): try again on the next tick.
+        .catch(() => setRetry((n) => n + 1));
+    }, DEMO_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [active, retry]);
+
+  const start = (kind: DemoJobKind) => {
+    setStarting(kind);
+    setErrors((prev) => ({ ...prev, [kind]: undefined }));
+    call<{ job: DemoJob; started: boolean }>(RESOLVERS[kind])
+      .then((r) => remember(r.job))
+      .catch((e: unknown) => setErrors((prev) => ({ ...prev, [kind]: message(e) })))
+      .finally(() => setStarting(undefined));
   };
-  const l = load.result;
-  const s = sim.result;
-  const busy = load.busy || sim.busy || resetting;
+
+  const busy = starting !== undefined || active !== undefined;
+  const l = doneResult<LoadDemoResult>(jobs.load);
+  const s = doneResult<SimulateResult>(jobs.simulate);
   return (
     <section className="setup__section">
       <h2 className="setup__heading">Demo data</h2>
@@ -342,9 +442,10 @@ function DemoData() {
         CSV export", and points the settings at SUP. Three pairs of pages contradict each other for the Radar. Safe to run more
         than once.
       </p>
-      <button type="button" className="setup__button" onClick={runLoad} disabled={busy}>
-        {load.busy ? 'Loading…' : 'Load demo data'}
+      <button type="button" className="setup__button" onClick={() => start('load')} disabled={busy}>
+        {starting === 'load' || isActive(jobs.load) ? 'Loading…' : 'Load demo data'}
       </button>
+      <JobProgress job={jobs.load} />
       {l && (
         <>
           <p role="status">
@@ -378,19 +479,16 @@ function DemoData() {
           permissions (Tripwire created the space as the app).
         </p>
       )}
-      {load.error && (
-        <p className="error" role="alert">
-          {load.error}
-        </p>
-      )}
+      <JobError job={jobs.load} error={errors.load} />
       <p className="muted">
         Adds 30 more <code>export</code> and 6 <code>billing</code> tickets to SUP (once), confirms the proposed tripwires of the
         other seven demo pages you can edit, moves dates and check-ins a month on, then evaluates the Jira-count tripwires twice
         so a crossed threshold trips and opens a Revisit task. The other tripwires are evaluated in the background.
       </p>
-      <button type="button" className="setup__button" onClick={runSim} disabled={busy}>
-        {sim.busy ? 'Simulating…' : 'Simulate a busy month'}
+      <button type="button" className="setup__button" onClick={() => start('simulate')} disabled={busy}>
+        {starting === 'simulate' || isActive(jobs.simulate) ? 'Simulating…' : 'Simulate a busy month'}
       </button>
+      <JobProgress job={jobs.simulate} />
       {s && (
         <p role="status">
           {s.created} tickets created · now {s.issueCount} export and {s.billingIssueCount} billing tickets in SUP
@@ -402,22 +500,25 @@ function DemoData() {
           {!s.complete && ' · not finished: click again to evaluate (no new tickets are created)'}
         </p>
       )}
-      {sim.error && (
-        <p className="error" role="alert">
-          {sim.error}
-        </p>
-      )}
-      <ResetDemo disabled={load.busy || sim.busy} onBusy={setResetting} />
+      <JobError job={jobs.simulate} error={errors.simulate} />
+      <ResetDemo job={jobs.reset} error={errors.reset} disabled={busy} onRun={() => start('reset')} />
     </section>
   );
 }
 
-mount(
-  <Shell title="Tripwire setup">
-    <Initialise />
-    <SettingsForm />
-    <DemoData />
-    <RunEvaluation />
-    <LlmProbe />
-  </Shell>,
-);
+function Setup() {
+  // Bumped when the database finishes setting up, so sections that failed with "setting up" load again.
+  const [ready, setReady] = useState(0);
+  const onReady = useCallback(() => setReady((n) => n + 1), []);
+  return (
+    <Shell title="Tripwire setup">
+      <Initialise onReady={onReady} />
+      <SettingsForm ready={ready} />
+      <DemoData ready={ready} />
+      <RunEvaluation />
+      <LlmProbe />
+    </Shell>
+  );
+}
+
+mount(<Setup />);

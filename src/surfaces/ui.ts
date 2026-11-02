@@ -3,18 +3,21 @@ import Resolver from '@forge/resolver';
 import { confluence } from '../adapters/confluence';
 import { jira, JiraUnavailableError } from '../adapters/jira';
 import { sqlRepo, type DecisionRow, type EvaluationRow, type RevisitRow, type TripwirePatch, type TripwireRow } from '../adapters/repo';
-import { loadDemoData, resetDemo, SeedError, simulateBusyMonth, type SeedDeps } from '../adapters/seed';
+import { demoSettings, listDemoPageIds, SeedError } from '../adapters/seed';
 import { ensureSchema, listAppliedMigrations } from '../adapters/sql';
 import { EvaluationRateLimitedError, evaluateMany, summarise, type EvalOutcome } from '../core/evaluator';
 import { jqlGuard, toCheckin } from '../core/extraction';
-import { LATEST_MIGRATION } from '../core/migrations';
+import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
+import { SchemaSettingUpError } from '../core/schema';
 import { reaffirmRevisit, suggestThreshold, type ReaffirmInput } from '../core/revisit';
 import { normaliseSettings, SettingsError, type Settings } from '../core/settings';
 import { EVALUABLE_STATUSES } from '../core/state';
 import { validateSpec } from '../core/triggers';
 import type { Assumption, JqlThresholdSpec } from '../core/types';
 import { asUserGraph, cloudIdFromInstallContext, fetchPairGraph } from '../adapters/teamworkGraph';
-import { enqueueEvaluation, enqueueExtraction, enqueueLlmProbe, enqueueRadarScan, evalDeps, RADAR_LAST_SCAN_KEY } from './background';
+import { randomUUID } from 'node:crypto';
+import { enqueueDemoJob, enqueueExtraction, enqueueLlmProbe, enqueueRadarScan, evalDeps, RADAR_LAST_SCAN_KEY } from './background';
+import { DEMO_JOB_LABELS, publicJob, readDemoJob, startDemoJob, type DemoJobDeps, type DemoJobKind, type PublicDemoJob } from './demoJob';
 import { radarGraphContextWith, radarListWith, RadarNotFoundError, type RadarViewDeps } from './radar';
 
 const resolver = new Resolver();
@@ -48,6 +51,12 @@ interface AdminCheck {
   who: string;
 }
 
+/** Reply while the database is still being set up (new install): a readable message, never "failed". */
+export function settingUpReply(err: unknown): { error: string; settingUp: true; applied: number; total: number } | undefined {
+  if (!(err instanceof SchemaSettingUpError)) return undefined;
+  return { error: err.message, settingUp: true, applied: err.applied, total: err.total };
+}
+
 const JIRA_ADMINS: AdminCheck = { allowed: (accountId) => jira.isAdmin(accountId), who: 'Jira administrators' };
 
 /**
@@ -70,6 +79,8 @@ async function adminOnly<T>(
     return await body();
   } catch (err) {
     if (err instanceof SettingsError || err instanceof SeedError) return { error: err.message };
+    const settingUp = settingUpReply(err);
+    if (settingUp) return settingUp;
     console.error(`Tripwire ${action} failed`, err);
     return { error: `${action} failed. Check the app logs.` };
   }
@@ -77,8 +88,15 @@ async function adminOnly<T>(
 
 resolver.define('initialise', ({ context }) =>
   adminOnly(context, 'Initialise', async () => {
-    await ensureSchema();
-    return { applied: await listAppliedMigrations(), latest: LATEST_MIGRATION };
+    try {
+      await ensureSchema();
+    } catch (err) {
+      // New install: the `schema-migrate` consumer is still applying migrations (paced for the DDL rate limit).
+      if (!(err instanceof SchemaSettingUpError)) throw err;
+      return { settingUp: true, applied: err.applied, total: err.total, latest: LATEST_MIGRATION };
+    }
+    const applied = await listAppliedMigrations();
+    return { applied, total: MIGRATIONS.length, latest: LATEST_MIGRATION };
   }),
 );
 
@@ -127,48 +145,62 @@ resolver.define('runEvaluationNow', ({ context }) =>
 
 // --- Demo data ------------------------------------------------------------------------------------
 
-const seedDeps: SeedDeps = {
-  jira,
-  confluence,
-  repo: sqlRepo,
-  enqueueExtraction,
-  enqueueEvaluation,
-  evaluate: async (ids) => {
-    try {
-      return { results: await evaluateMany(ids, evalDeps), rateLimited: false };
-    } catch (err) {
-      if (!(err instanceof EvaluationRateLimitedError)) throw err;
-      return { results: err.done, rateLimited: true };
+const demoJobDeps = (): DemoJobDeps => ({ repo: sqlRepo, push: enqueueDemoJob, now: () => Date.now(), newId: () => randomUUID() });
+
+/** Which remembered demo pages the caller can edit (asUser), for the consumer that cannot ask Confluence as them. */
+async function demoPageAccess(): Promise<{ editable: string[]; checked: string[] }> {
+  const ids = await listDemoPageIds(sqlRepo);
+  const results = await Promise.all(
+    ids.map(async (pageId) => {
+      try {
+        return { pageId, canEdit: await confluence.canEditPage(pageId) };
+      } catch (err) {
+        console.warn('tripwire demo: could not check page access', { pageId, error: err instanceof Error ? err.message : String(err) });
+        return { pageId, canEdit: undefined };
+      }
+    }),
+  );
+  return {
+    editable: results.filter((r) => r.canEdit === true).map((r) => r.pageId),
+    checked: results.filter((r) => r.canEdit !== undefined).map((r) => r.pageId),
+  };
+}
+
+/** Validates, then queues the demo job (or returns the one already running); the work runs in the `demo-seed` consumer. */
+function startDemo(context: unknown, kind: DemoJobKind) {
+  return adminOnly(context, DEMO_JOB_LABELS[kind], async () => {
+    await ensureSchema();
+    const accountId = (context as ResolverContext).accountId as string;
+    if (!/^[A-Za-z0-9:_-]{1,128}$/.test(accountId)) throw new SeedError('Unknown user.');
+    // Same check Load runs before creating anything, so a bad setting fails on the click instead of in the job.
+    if (kind === 'load') demoSettings(await sqlRepo.getSettings());
+    const started = await startDemoJob(kind, accountId, kind === 'reset' ? async () => ({ editable: [], checked: [] }) : demoPageAccess, demoJobDeps());
+    if ('job' in started) console.info('tripwire demo job', { kind, jobId: started.job.id, started: started.started, status: started.job.status });
+    return started;
+  });
+}
+
+resolver.define('loadDemoData', ({ context }) => startDemo(context, 'load'));
+resolver.define('simulateBusyMonth', ({ context }) => startDemo(context, 'simulate'));
+resolver.define('resetDemo', ({ context }) => startDemo(context, 'reset'));
+
+/** Polled by the setup page while a demo job runs; also tells a reopened page about a job still running. */
+resolver.define('getDemoJob', ({ context }) =>
+  adminOnly(context, 'Read demo job', async (): Promise<{ job: PublicDemoJob | null }> => {
+    await ensureSchema();
+    const job = await readDemoJob(demoJobDeps());
+    if (!job) return { job: null };
+    const view = publicJob(job);
+    // The consumer could not check access to a page Load just created: check it now, as the admin.
+    const result = view.result as { pageId?: unknown; canEdit?: unknown } | undefined;
+    if (view.kind === 'load' && view.status === 'done' && result && result.canEdit === null && typeof result.pageId === 'string') {
+      try {
+        return { job: { ...view, result: { ...result, canEdit: await confluence.canEditPage(result.pageId) } } };
+      } catch (err) {
+        console.warn('tripwire getDemoJob: could not check page access', { pageId: result.pageId, error: err instanceof Error ? err.message : String(err) });
+      }
     }
-  },
-  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  now: () => Date.now(),
-};
-
-resolver.define('loadDemoData', ({ context }) =>
-  adminOnly(context, 'Load demo data', async () => {
-    await ensureSchema();
-    const result = await loadDemoData((context as ResolverContext).accountId as string, seedDeps);
-    console.info('tripwire loadDemoData', { pageId: result.pageId, issueCount: result.issueCount, billingIssueCount: result.billingIssueCount, pages: result.pages.length, extractionsQueued: result.extractionsQueued, complete: result.complete, created: result.created });
-    return result;
-  }),
-);
-
-resolver.define('simulateBusyMonth', ({ context }) =>
-  adminOnly(context, 'Simulate a busy month', async () => {
-    await ensureSchema();
-    const result = await simulateBusyMonth(seedDeps, (context as ResolverContext).accountId as string);
-    console.info('tripwire simulateBusyMonth', { created: result.created, issueCount: result.issueCount, billingIssueCount: result.billingIssueCount, indexed: result.indexed, complete: result.complete, passes: result.passes, revisits: result.revisits.length, confirmed: result.confirmed, queued: result.queued });
-    return result;
-  }),
-);
-
-resolver.define('resetDemo', ({ context }) =>
-  adminOnly(context, 'Reset demo', async () => {
-    await ensureSchema();
-    const result = await resetDemo((context as ResolverContext).accountId as string, seedDeps);
-    console.info('tripwire resetDemo', { ...result, revisitIssueKeys: result.revisitIssueKeys.length, warnings: result.warnings.length });
-    return result;
+    return { job: view };
   }),
 );
 
@@ -227,6 +259,8 @@ async function onHealth<T>(context: unknown, action: string, body: (ctx: Resolve
     return await body({ ...ctx, accountId: ctx.accountId });
   } catch (err) {
     if (err instanceof RadarNotFoundError) return { error: err.message };
+    const settingUp = settingUpReply(err);
+    if (settingUp) return settingUp;
     if (err instanceof Error && isForgePlatformError(err)) throw err;
     console.error(`Tripwire ${action} failed`, err);
     return { error: `${action} failed. Check the app logs.` };
@@ -332,6 +366,8 @@ async function onPage<T>(
     return await body(String(pageId), ctx.accountId);
   } catch (err) {
     if (err instanceof UserError) return { error: err.message };
+    const settingUp = settingUpReply(err);
+    if (settingUp) return settingUp;
     // e.g. NeedsAuthenticationError from asUser(): the bridge turns it into the consent prompt.
     if (err instanceof Error && isForgePlatformError(err)) throw err;
     console.error(`Tripwire ${action} failed`, err);
@@ -451,6 +487,8 @@ resolver.define('getRevisit', async ({ context }) => {
   } catch (err) {
     // e.g. NeedsAuthenticationError from asUser(): the bridge turns it into the consent prompt.
     if (err instanceof Error && isForgePlatformError(err)) throw err;
+    const settingUp = settingUpReply(err);
+    if (settingUp) return settingUp;
     console.error('Tripwire Load revisit failed', err);
     return { error: 'Load revisit failed. Check the app logs.' };
   }
@@ -484,6 +522,8 @@ resolver.define('reaffirmRevisit', async ({ payload, context }) => {
     });
   } catch (err) {
     if (err instanceof Error && isForgePlatformError(err)) throw err;
+    const settingUp = settingUpReply(err);
+    if (settingUp) return settingUp;
     console.error('Tripwire Reaffirm failed', err);
     return { error: 'Reaffirm failed. Check the app logs.' };
   }

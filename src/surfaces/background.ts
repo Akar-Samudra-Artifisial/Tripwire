@@ -2,9 +2,12 @@ import { InvocationError, InvocationErrorCode, Queue } from '@forge/events';
 import { confluence } from '../adapters/confluence';
 import { jira } from '../adapters/jira';
 import { sqlRepo, type Repo } from '../adapters/repo';
-import { ensureSchema } from '../adapters/sql';
+import { loadDemoData, resetDemo, SeedError, simulateBusyMonth, type SeedDeps } from '../adapters/seed';
+import { ensureSchema, requestMigration, runMigrations } from '../adapters/sql';
 import { BATCH_SIZE, chunk, EvaluationRateLimitedError, evaluateMany, summarise, type EvalDeps } from '../core/evaluator';
 import { extractPage, type ExtractDeps } from '../core/extractPipeline';
+import { SchemaSettingUpError } from '../core/schema';
+import { SettingsError } from '../core/settings';
 import { runRadarScan, type RadarScanDeps, type RadarScanResult } from '../core/radar';
 import { openRevisit } from '../core/revisit';
 import { EVALUABLE_STATUSES } from '../core/state';
@@ -13,14 +16,17 @@ import type { ContentChangeSpec } from '../core/types';
 import { chatTool, isLlmRateLimited } from '../llm';
 import { repairAssumption, runExtraction } from '../llm/extract';
 import { classifyPair } from '../llm/radar';
+import { DEMO_JOB_LOCK_SECONDS, runDemoJob, type DemoJob, type DemoProgress } from './demoJob';
 
 export const EXTRACT_QUEUE = 'extract';
 export const EVALUATE_QUEUE = 'evaluate';
 export const RADAR_QUEUE = 'radar-scan';
+export const DEMO_QUEUE = 'demo-seed';
 
 const extractQueue = new Queue({ key: EXTRACT_QUEUE });
 const evaluateQueue = new Queue({ key: EVALUATE_QUEUE });
 const radarQueue = new Queue({ key: RADAR_QUEUE });
+const demoQueue = new Queue({ key: DEMO_QUEUE });
 
 /**
  * App lock held by one Radar scan at a time. It outlives the consumer timeout (900 s in manifest.yml), so a second
@@ -89,7 +95,7 @@ export async function contentChangeTripwireIds(pageId: string, repo: Pick<Repo, 
 export async function onPageEvent(event: PageEvent): Promise<void> {
   const pageId = event.content?.id;
   if (!pageId) return;
-  await ensureSchema();
+  if (!(await schemaReady('onPageEvent'))) return;
   try {
     const ids = await contentChangeTripwireIds(pageId, sqlRepo);
     if (ids.length > 0) {
@@ -133,7 +139,7 @@ async function pushBatches(ids: readonly string[], delayInSeconds?: number, atte
 
 /** Daily: apply pending migrations, queue a Radar scan, then fan out evaluation batches of `BATCH_SIZE` tripwires. */
 export async function scheduleEvaluation(): Promise<void> {
-  await ensureSchema();
+  if (!(await schemaReady('scheduleEvaluation'))) return;
   await scheduleRadarScan();
   const ids: string[] = [];
   for (let offset = 0; offset < MAX_SCHEDULED; offset += 500) {
@@ -197,14 +203,135 @@ export async function radarScanWith(deps: RadarConsumerDeps): Promise<{ status: 
 
 /** Consumer for the `radar-scan` queue. */
 export async function radarScan(): Promise<InvocationError | void> {
-  await ensureSchema();
+  if (!(await schemaReady('radarScan'))) return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
   const outcome = await radarScanWith({ repo: sqlRepo, classify: (a, b) => classifyPair(a, b), now });
   if (outcome.status === 'locked') return retryLater(60, 'locked');
   if (outcome.status === 'rate_limited') return retryLater(RATE_LIMIT_DELAY_SECONDS);
 }
 
+/** Queue consumers whose schema is still being set up retry after this delay. */
+const SCHEMA_RETRY_SECONDS = 60;
+/** Time the `schema-migrate` consumer spends waiting out the DDL rate limit before re-queueing (timeout is 900 s). */
+const MIGRATE_BUDGET_MS = 12 * 60 * 1000;
+
+/** `ensureSchema` for background work: false while the schema is still being set up (a migration run is queued). */
+async function schemaReady(where: string): Promise<boolean> {
+  try {
+    await ensureSchema();
+    return true;
+  } catch (err) {
+    if (!(err instanceof SchemaSettingUpError)) throw err;
+    console.info(`tripwire ${where}: database still being set up`, { applied: err.applied, total: err.total });
+    return false;
+  }
+}
+
+/** Lifecycle trigger (app installed / major upgrade): start the schema migration right away. */
+export async function onAppLifecycle(event: { eventType?: string }): Promise<void> {
+  const jobId = await requestMigration(event.eventType ?? 'lifecycle');
+  console.info('tripwire migrations: queued', { eventType: event.eventType, jobId });
+}
+
+/**
+ * Consumer for the `schema-migrate` queue: the only place that runs DDL. Waits out the Forge SQL DDL rate limit
+ * (25 per minute; a new install has ~30 migrations) and re-queues itself if it runs out of time.
+ */
+export async function migrateSchema(): Promise<InvocationError | void> {
+  const result = await runMigrations(MIGRATE_BUDGET_MS);
+  console.info('tripwire migrations', result);
+  if (result.status === 'pending') return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
+}
+
 interface QueueEvent {
   body?: Record<string, unknown>;
+}
+
+// --- Demo data (setup page buttons) -----------------------------------------------------------------
+
+/** Demo seeding as the app (also used by tests through `demoSeedDeps`). */
+export const seedDeps: SeedDeps = {
+  jira,
+  confluence,
+  repo: sqlRepo,
+  enqueueExtraction,
+  enqueueEvaluation,
+  evaluate: async (ids) => {
+    try {
+      return { results: await evaluateMany(ids, evalDeps), rateLimited: false };
+    } catch (err) {
+      if (!(err instanceof EvaluationRateLimitedError)) throw err;
+      return { results: err.done, rateLimited: true };
+    }
+  },
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+};
+
+/** The demo consumer stops starting new work after this long (its timeout is 900 s). */
+export const DEMO_BUDGET_MS = 12 * 60 * 1000;
+/** How long the consumer waits for Jira search to see the demo tickets. */
+export const DEMO_INDEX_WAIT_MS = 3 * 60 * 1000;
+
+/**
+ * Seed wiring for one background job: long limits, progress reporting, and page access from the resolver's check
+ * (a queue consumer has no user, so `canEditPage` cannot run here). Pages nobody checked throw, which the seed
+ * functions already treat as "unknown".
+ */
+export function demoSeedDeps(base: SeedDeps, job: Pick<DemoJob, 'editablePageIds' | 'checkedPageIds'>, progress: DemoProgress): SeedDeps {
+  const editable = new Set(job.editablePageIds);
+  const checked = new Set(job.checkedPageIds);
+  return {
+    ...base,
+    confluence: {
+      ...base.confluence,
+      canEditPage: async (pageId) => {
+        if (editable.has(pageId)) return true;
+        if (checked.has(pageId)) return false;
+        throw new Error(`Page ${pageId} access was not checked before the demo job started`);
+      },
+    },
+    limits: { budgetMs: DEMO_BUDGET_MS, indexWaitMs: DEMO_INDEX_WAIT_MS, lockSeconds: DEMO_JOB_LOCK_SECONDS },
+    progress,
+  };
+}
+
+/** Runs one demo job's work with `deps` (logged like the old inline resolvers). */
+export async function runDemoWork(job: DemoJob, deps: SeedDeps): Promise<unknown> {
+  switch (job.kind) {
+    case 'load': {
+      const result = await loadDemoData(job.accountId, deps);
+      console.info('tripwire loadDemoData', { pageId: result.pageId, issueCount: result.issueCount, billingIssueCount: result.billingIssueCount, pages: result.pages.length, extractionsQueued: result.extractionsQueued, complete: result.complete, created: result.created });
+      return result;
+    }
+    case 'simulate': {
+      const result = await simulateBusyMonth(deps, job.accountId);
+      console.info('tripwire simulateBusyMonth', { created: result.created, issueCount: result.issueCount, billingIssueCount: result.billingIssueCount, indexed: result.indexed, complete: result.complete, passes: result.passes, revisits: result.revisits.length, confirmed: result.confirmed, queued: result.queued });
+      return result;
+    }
+    case 'reset': {
+      const result = await resetDemo(job.accountId, deps);
+      console.info('tripwire resetDemo', { ...result, revisitIssueKeys: result.revisitIssueKeys.length, warnings: result.warnings.length });
+      return result;
+    }
+  }
+}
+
+/** Queues a demo job for the `demo-seed` consumer. */
+export async function enqueueDemoJob(jobId: string): Promise<void> {
+  await demoQueue.push({ body: { jobId } });
+}
+
+/** Consumer for the `demo-seed` queue: runs one "Load demo data" / "Simulate a busy month" / "Reset demo" job to the end. */
+export async function demoJob(event: QueueEvent): Promise<InvocationError | void> {
+  const jobId = event.body?.jobId;
+  if (typeof jobId !== 'string' || jobId === '') throw new Error('demo event is missing jobId');
+  if (!(await schemaReady('demoJob'))) return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
+  await runDemoJob(jobId, {
+    repo: sqlRepo,
+    now: () => Date.now(),
+    run: (job, progress) => runDemoWork(job, demoSeedDeps({ ...seedDeps, repo: sqlRepo }, job, progress)),
+    userMessage: (err) => (err instanceof SeedError || err instanceof SettingsError ? err.message : undefined),
+  });
 }
 
 /** Asks the queue to redeliver the event after `seconds` (used when Forge LLM is rate limited). */
@@ -254,7 +381,7 @@ export async function extractDecision(event: QueueEvent): Promise<InvocationErro
   if (typeof pageId !== 'string') throw new Error('extract event is missing pageId');
   const force = event.body?.force === true;
   const requestedBy = typeof event.body?.requestedBy === 'string' ? event.body.requestedBy : undefined;
-  await ensureSchema();
+  if (!(await schemaReady('extractDecision'))) return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
   try {
     const result = await extractPage({ pageId, force, requestedBy }, extractDeps);
     console.info('tripwire extract', { pageId, force, ...result });
@@ -273,14 +400,14 @@ export async function extractDecision(event: QueueEvent): Promise<InvocationErro
 }
 
 /** Consumer for the `evaluate` queue: evaluates up to `BATCH_SIZE` tripwires in order. */
-export async function evaluateBatch(event: QueueEvent): Promise<void> {
+export async function evaluateBatch(event: QueueEvent): Promise<InvocationError | void> {
   const ids = event.body?.tripwireIds;
   if (!Array.isArray(ids) || ids.length > BATCH_SIZE || !ids.every((id): id is string => typeof id === 'string' && id !== '')) {
     throw new Error(`evaluate event tripwireIds must be an array of at most ${BATCH_SIZE} ids`);
   }
   const rawAttempt = event.body?.attempt;
   const attempt = typeof rawAttempt === 'number' && Number.isInteger(rawAttempt) && rawAttempt > 0 ? rawAttempt : 1;
-  await ensureSchema();
+  if (!(await schemaReady('evaluateBatch'))) return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
   try {
     const results = await evaluateMany(ids, evalDeps);
     console.info('tripwire evaluateBatch', summarise(results));

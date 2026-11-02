@@ -46,6 +46,12 @@ modules:
       events:
         - avi:confluence:created:page
         - avi:confluence:updated:page
+    # New install / major upgrade: start the schema migration (paced for the Forge SQL DDL rate limit).
+    - key: on-app-lifecycle
+      function: app-lifecycle
+      events:
+        - avi:forge:installed:app
+        - avi:forge:upgraded:app
   scheduledTrigger:
     - key: daily-evaluate
       function: schedule-evaluation
@@ -60,6 +66,13 @@ modules:
     - key: radar-consumer
       queue: radar-scan
       function: radar-scan
+    - key: migrate-consumer
+      queue: schema-migrate
+      function: migrate-schema
+    # Demo buttons on Tripwire setup: the whole Load/Simulate/Reset runs here; the page polls its progress.
+    - key: demo-consumer
+      queue: demo-seed
+      function: demo-job
 
   # --- Rovo ---
   rovo:agent:
@@ -120,6 +133,14 @@ modules:
       handler: index.listTripped
     - key: radar-scan
       handler: index.radarScan
+      timeoutSeconds: 900
+    - key: app-lifecycle
+      handler: index.onAppLifecycle
+    - key: migrate-schema
+      handler: index.migrateSchema
+      timeoutSeconds: 900
+    - key: demo-job
+      handler: index.demoJob
       timeoutSeconds: 900
 
 resources:

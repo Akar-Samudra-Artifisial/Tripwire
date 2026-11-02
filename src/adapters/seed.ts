@@ -334,7 +334,34 @@ export interface SeedDeps {
   evaluate: (ids: readonly string[]) => Promise<{ results: EvalOutcome[]; rateLimited: boolean }>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  /** Limits for the demo queue consumer (up to 900 s); the defaults fit one 25 s resolver call. */
+  limits?: SeedLimits;
+  /** Progress of a background demo job: step `step` of `total`, with a one-line message. */
+  progress?: (step: number, total: number, message: string) => Promise<void>;
 }
+
+export interface SeedLimits {
+  /** Stop starting new work after this much time. */
+  budgetMs: number;
+  /** How long to wait for Jira search to see (or stop counting) the demo tickets. */
+  indexWaitMs: number;
+  /** How long the demo and page locks last (must cover the whole run). */
+  lockSeconds: number;
+}
+
+const budgetOf = (deps: SeedDeps): number => deps.limits?.budgetMs ?? TIME_BUDGET_MS;
+const indexWaitOf = (deps: SeedDeps): number => deps.limits?.indexWaitMs ?? INDEX_WAIT_MS;
+const lockSecondsOf = (deps: SeedDeps): number => deps.limits?.lockSeconds ?? LOCK_SECONDS;
+/** Poll Jira search less often during a long background wait. */
+const indexPollOf = (deps: SeedDeps): number => (indexWaitOf(deps) > INDEX_WAIT_MS ? 3 * INDEX_POLL_MS : INDEX_POLL_MS);
+const report = async (deps: SeedDeps, step: number, total: number, message: string): Promise<void> => {
+  if (deps.progress) await deps.progress(step, total, message);
+};
+
+/** Progress steps per demo job. */
+export const LOAD_STEPS = 2 + DEMO_PAGES.length;
+export const SIMULATE_STEPS = 5;
+export const RESET_STEPS = 3;
 
 interface DemoState {
   /** The "Defer CSV export" page (states written before the Lumora pages only have this one). */
@@ -356,7 +383,7 @@ const ISSUE_KEY = /^[A-Z][A-Z0-9_]{0,9}-\d{1,9}$/;
 const PAGE_ID = /^\d{1,20}$/;
 const SLUGS = new Set(DEMO_PAGES.map((p) => p.slug));
 
-async function readDemoState(repo: SeedDeps['repo']): Promise<DemoState> {
+async function readDemoState(repo: Pick<SeedDeps['repo'], 'getAppValue'>): Promise<DemoState> {
   const raw = await repo.getAppValue(DEMO_STATE_KEY);
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const v = raw as Record<string, unknown>;
@@ -377,6 +404,11 @@ async function readDemoState(repo: SeedDeps['repo']): Promise<DemoState> {
     ...(v.resetPending === true ? { resetPending: true } : {}),
     ...(resetPageIds.length > 0 ? { resetPageIds } : {}),
   };
+}
+
+/** Remembered demo page ids, "Defer CSV export" first (empty before "Load demo data"). */
+export async function listDemoPageIds(repo: Pick<SeedDeps['repo'], 'getAppValue'>): Promise<string[]> {
+  return demoPageIds(await readDemoState(repo));
 }
 
 /** Demo page ids, the "Defer CSV export" page first; only that one for states written before the Lumora pages. */
@@ -418,16 +450,21 @@ export function demoSettings(current: Settings): Settings {
   });
 }
 
-/** Runs `body` under the named lock. Kept for the full cooldown on success when `cooldown` (search lags behind writes). */
+/**
+ * Runs `body` under the named lock. Kept for the `LOCK_SECONDS` cooldown on success when `cooldown` (search lags
+ * behind writes), also when a background job held it longer.
+ */
 async function withLock<T>(deps: SeedDeps, name: string, cooldown: boolean, body: () => Promise<T>): Promise<T> {
-  if (!(await deps.repo.acquireAppLock(name, new Date(deps.now()).toISOString(), LOCK_SECONDS))) throw new SeedError(BUSY_MESSAGE);
+  const seconds = lockSecondsOf(deps);
+  if (!(await deps.repo.acquireAppLock(name, new Date(deps.now()).toISOString(), seconds))) throw new SeedError(BUSY_MESSAGE);
   let ok = false;
   try {
     const result = await body();
     ok = true;
     return result;
   } finally {
-    if (!ok || !cooldown) await deps.repo.releaseAppLock(name);
+    if (!ok || !cooldown || seconds !== LOCK_SECONDS) await deps.repo.releaseAppLock(name);
+    if (ok && cooldown && seconds !== LOCK_SECONDS) await deps.repo.acquireAppLock(name, new Date(deps.now()).toISOString(), LOCK_SECONDS);
   }
 }
 
@@ -483,7 +520,8 @@ export async function loadDemoData(accountId: string, deps: SeedDeps): Promise<L
   const settings = demoSettings(await repo.getSettings());
 
   return withLock(deps, LOAD_LOCK, true, async () => {
-    const deadline = deps.now() + TIME_BUDGET_MS;
+    const deadline = deps.now() + budgetOf(deps);
+    await report(deps, 1, LOAD_STEPS, 'Creating Jira project SUP and the baseline tickets');
     let projectCreated = false;
     if (!(await jira.getProject(DEMO.projectKey))) {
       await jira.createProject({
@@ -508,6 +546,7 @@ export async function loadDemoData(accountId: string, deps: SeedDeps): Promise<L
     // Before the pages exist, so their extraction already allows JQL in SUP.
     await repo.saveSettings(settings);
 
+    await report(deps, 2, LOAD_STEPS, 'Creating Confluence space DEC');
     let spaceCreated = false;
     let space = await confluence.findSpace(DEMO.spaceKey);
     if (!space) {
@@ -522,12 +561,13 @@ export async function loadDemoData(accountId: string, deps: SeedDeps): Promise<L
     let mainLabelAdded = false;
     let extractionJobId: string | undefined;
     let complete = true;
-    for (const demo of DEMO_PAGES) {
+    for (const [index, demo] of DEMO_PAGES.entries()) {
       // Pages already handled are cheap to check again, so a click after a timeout simply continues.
       if (deps.now() >= deadline) {
         complete = false;
         break;
       }
+      await report(deps, 3 + index, LOAD_STEPS, `Decision page ${index + 1} of ${DEMO_PAGES.length}: ${demo.title}`);
       let created = false;
       let page = await confluence.findPageByTitle(space.id, demo.title);
       if (!page) {
@@ -683,12 +723,12 @@ async function confirmOtherDemoTripwires(pageIds: readonly string[], accountId: 
 
 /** Waits until Jira's approximate counts see at least the target number of demo tickets (search is eventually consistent). */
 async function waitForCounts(target: number, billingTarget: number, deps: SeedDeps): Promise<{ count: number; billing: number; indexed: boolean }> {
-  const deadline = deps.now() + INDEX_WAIT_MS;
+  const deadline = deps.now() + indexWaitOf(deps);
   for (;;) {
     const [count, billing] = await Promise.all([deps.jira.countIssues(DEMO_JQL), deps.jira.countIssues(BILLING_JQL)]);
     if (count >= target && billing >= billingTarget) return { count, billing, indexed: true };
     if (deps.now() >= deadline) return { count, billing, indexed: false };
-    await deps.sleep(INDEX_POLL_MS);
+    await deps.sleep(indexPollOf(deps));
   }
 }
 
@@ -703,7 +743,7 @@ async function waitForCounts(target: number, billingTarget: number, deps: SeedDe
 export async function simulateBusyMonth(deps: SeedDeps, accountId: string): Promise<SimulateResult> {
   if (!/^[A-Za-z0-9:_-]{1,128}$/.test(accountId)) throw new SeedError('Unknown user.');
   const { jira, repo } = deps;
-  const deadline = deps.now() + TIME_BUDGET_MS;
+  const deadline = deps.now() + budgetOf(deps);
   const state = await readDemoState(repo);
   if (!state.pageId || !(await jira.getProject(DEMO.projectKey))) throw new SeedError('Run "Load demo data" first.');
   if (state.resetPending || state.resetPageIds) throw new SeedError(`"Reset demo" has not finished: ${INDEX_LAG_MESSAGE} Click "Reset demo" again.`);
@@ -717,6 +757,7 @@ export async function simulateBusyMonth(deps: SeedDeps, accountId: string): Prom
 
   return withLock(deps, SIMULATE_LOCK, false, async () => {
     const started = deps.now();
+    await report(deps, 1, SIMULATE_STEPS, 'Creating the busy month tickets and confirming the other demo tripwires');
     let created = 0;
     let target = 0;
     let billingTarget = 0;
@@ -744,6 +785,7 @@ export async function simulateBusyMonth(deps: SeedDeps, accountId: string): Prom
 
     const confirmed = await confirming;
     const prepared = deps.now();
+    await report(deps, 2, SIMULATE_STEPS, 'Waiting for Jira search to count the new tickets');
     const { count, billing, indexed } = await waitForCounts(target, billingTarget, deps);
 
     // Every evaluable demo tripwire, per page (read after confirming).
@@ -762,6 +804,7 @@ export async function simulateBusyMonth(deps: SeedDeps, accountId: string): Prom
     // A month passes for the date/checkin/content_change tripwires too, so the same evaluation trips them.
     // Pages in parallel (a content_change tripwire edits its page: two Confluence calls each).
     if (indexed) {
+      await report(deps, 3, SIMULATE_STEPS, 'Moving dates, check-ins and pages a month on');
       const agedPerPage = await Promise.all(
         pageTripwires.map(({ pageId, tripwires }) => ageDemoTripwires(pageId, demoPageOf(state, pageId)?.storage(isoDay(deps.now())) ?? DEMO_PAGE_STORAGE, tripwires, deps)),
       );
@@ -774,6 +817,7 @@ export async function simulateBusyMonth(deps: SeedDeps, accountId: string): Prom
     const revisitIds = new Set<string>();
     // A reading taken before search sees the tickets would reset the strikes, so skip evaluating then.
     while (indexed && passes.length < 2 && deps.now() < deadline) {
+      await report(deps, 4 + passes.length, SIMULATE_STEPS, `Evaluating the Jira-count tripwires (pass ${passes.length + 1} of 2)`);
       const { results, rateLimited } = await deps.evaluate(inline);
       passes.push({ ...summarise(results), total: inline.length, rateLimited });
       for (const r of results) if (r.status === 'evaluated' && r.revisitRequested) revisitIds.add(r.tripwireId);
@@ -872,7 +916,7 @@ export async function resetDemo(accountId: string, deps: SeedDeps): Promise<Rese
       try {
         for (const pageId of pageIds) {
           for (const lock of RESET_PAGE_LOCKS) {
-            if (!(await repo.acquirePageLock(pageId, lock, new Date(deps.now()).toISOString(), LOCK_SECONDS))) throw new SeedError(PAGE_BUSY_MESSAGE);
+            if (!(await repo.acquirePageLock(pageId, lock, new Date(deps.now()).toISOString(), lockSecondsOf(deps)))) throw new SeedError(PAGE_BUSY_MESSAGE);
             held.push([pageId, lock]);
           }
         }
@@ -894,7 +938,7 @@ export async function resetDemo(accountId: string, deps: SeedDeps): Promise<Rese
 
 async function resetLocked(pageIds: readonly string[], state: DemoState, deps: SeedDeps): Promise<{ result: ResetDemoResult; resetPageIds: string[] }> {
   const { jira, repo } = deps;
-  const deadline = deps.now() + TIME_BUDGET_MS;
+  const deadline = deps.now() + budgetOf(deps);
   const warnings: string[] = [];
   const revisitIssueKeys: string[] = [];
   const resetPageIds: string[] = [];
@@ -920,6 +964,7 @@ async function resetLocked(pageIds: readonly string[], state: DemoState, deps: S
   });
 
   if (await jira.getProject(DEMO.projectKey)) {
+    await report(deps, 1, RESET_STEPS, 'Relabelling the busy month tickets');
     const tickets = await jira.searchIssues(RESET_JQL, RESET_SCAN_MAX);
     const keys = new Set(state.simulatedKeys ?? []);
     const simulated = tickets.filter((t) => keys.has(t.key) || isSimulatedTicket(t));
@@ -952,6 +997,7 @@ async function resetLocked(pageIds: readonly string[], state: DemoState, deps: S
   // have recreated the decision, which must not be deleted again.
   const done = new Set(state.resetPending ? pageIds : (state.resetPageIds ?? []));
   const today = isoDay(deps.now());
+  await report(deps, 2, RESET_STEPS, 'Resetting the demo decisions');
   for (const pageId of pageIds) {
     if (done.has(pageId)) continue;
     if (deps.now() >= deadline) {
@@ -1000,7 +1046,8 @@ async function resetLocked(pageIds: readonly string[], state: DemoState, deps: S
 
   let indexed = true;
   if (state.simulatedTickets !== undefined || relabelled > 0) {
-    const waitUntil = deps.now() + INDEX_WAIT_MS;
+    await report(deps, 3, RESET_STEPS, 'Waiting for Jira search to stop counting the busy month tickets');
+    const waitUntil = deps.now() + indexWaitOf(deps);
     for (;;) {
       const [count, billing] = await Promise.all([jira.countIssues(DEMO_JQL), jira.countIssues(BILLING_JQL)]);
       if (count <= remaining && billing <= remainingBilling) break;
@@ -1008,7 +1055,7 @@ async function resetLocked(pageIds: readonly string[], state: DemoState, deps: S
         indexed = false;
         break;
       }
-      await deps.sleep(INDEX_POLL_MS);
+      await deps.sleep(indexPollOf(deps));
     }
   }
   if (!indexed) {
