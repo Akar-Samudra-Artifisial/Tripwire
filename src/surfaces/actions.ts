@@ -3,6 +3,7 @@ import { confluence } from '../adapters/confluence';
 import { sqlRepo, type Repo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { SchemaSettingUpError } from '../core/schema';
+import { formatReading, type ReadingInput } from '../core/describe';
 import type { TripwireStatus } from '../core/types';
 
 export interface ListTrippedPayload {
@@ -23,10 +24,12 @@ export interface UntrustedPageContent {
 export interface TrippedDecision {
   pageContent: UntrustedPageContent;
   pageUrl?: string;
-  /** Latest measured value; null when the tripwire has no numeric reading. */
-  lastValue: number | null;
-  /** e.g. "> 10"; null for non-numeric tripwires or an incomplete spec. */
-  threshold: string | null;
+  /** Latest measured count (numeric tripwires only; omitted for date/check-in/page-change tripwires). */
+  lastValue?: number | null;
+  /** e.g. "> 10"; null for an incomplete spec. Numeric tripwires only. */
+  threshold?: string | null;
+  /** Why the status is what it is, in words: "37 (measured …) · threshold > 10", "5 days past 2026-11-05 (measured …)", "page edited: version 9 (accepted 4)". */
+  reading: string;
   status: TripwireStatus;
   revisitIssueKey?: string;
   lastEvaluatedAt: string | null;
@@ -80,11 +83,20 @@ export function statusesFor(raw: unknown): TripwireStatus[] {
   return ['tripped', 'revisiting'];
 }
 
+const numeric = (kind: string): boolean => kind === 'jql_threshold' || kind === 'graph_relation';
+
 /** "> 10" for a numeric tripwire with a complete spec, otherwise null. */
 export function thresholdText(kind: string, spec: unknown): string | null {
-  if (kind !== 'jql_threshold' && kind !== 'graph_relation') return null;
+  if (!numeric(kind)) return null;
   const { op, value } = (spec ?? {}) as { op?: unknown; value?: unknown };
   return typeof op === 'string' && op !== '' && typeof value === 'number' && Number.isFinite(value) ? `${op} ${value}` : null;
+}
+
+/** Status reason in words; a numeric tripwire with an incomplete spec says "no threshold" instead of "undefined". */
+function readingFor(t: ReadingInput): string {
+  if (!numeric(t.kind) || thresholdText(t.kind, t.spec) !== null) return formatReading(t);
+  if (t.lastValue === null) return 'not measured yet · no threshold';
+  return `${t.lastValue}${t.lastEvaluatedAt ? ` (measured ${t.lastEvaluatedAt.slice(0, 10)})` : ''} · no threshold`;
 }
 
 type Access = { page: { title: string; webUrl?: string } } | { hidden: 'denied' | 'auth' };
@@ -145,8 +157,9 @@ export async function listTrippedWith(payload: ListTrippedPayload, deps: ListTri
           ...(row.decision.team ? { team: row.decision.team } : {}),
         },
         ...(page.webUrl ? { pageUrl: page.webUrl } : {}),
-        lastValue: tripwire.lastValue,
-        threshold: thresholdText(tripwire.kind, tripwire.spec),
+        // Non-numeric kinds keep days left / a page version in lastValue: only the worded reading is returned for them.
+        ...(numeric(tripwire.kind) ? { lastValue: tripwire.lastValue, threshold: thresholdText(tripwire.kind, tripwire.spec) } : {}),
+        reading: readingFor(tripwire),
         status: tripwire.status,
         ...(row.revisitIssueKey ? { revisitIssueKey: row.revisitIssueKey } : {}),
         lastEvaluatedAt: tripwire.lastEvaluatedAt,

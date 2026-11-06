@@ -59,6 +59,7 @@ describe('list-tripped', () => {
       pageUrl: `https://site/wiki/pages/${a.pageId}`,
       lastValue: 37,
       threshold: '> 10',
+      reading: '37 (measured 2026-10-02) · threshold > 10',
       status: 'revisiting',
       revisitIssueKey: 'SUP-38',
       lastEvaluatedAt: '2026-10-02T09:00:00.000Z',
@@ -99,10 +100,38 @@ describe('list-tripped', () => {
     const b = watched('tripped', { day: 2 });
     repo.tripwires.set(b.tripwireId, { ...repo.tripwires.get(b.tripwireId)!, kind: 'checkin', spec: { every: 'month', question: 'Still true?' } });
     const result = await listTrippedWith({}, deps);
-    expect(result.decisions.map((d) => d.threshold)).toEqual([null, null]);
+    expect(result.decisions[0]).toMatchObject({ threshold: null, reading: '37 (measured 2026-10-03) · no threshold' });
+    expect(result.decisions[1]).not.toHaveProperty('threshold');
     expect(JSON.stringify(result)).not.toContain('undefined');
     expect(thresholdText('jql_threshold', { op: '>' })).toBeNull();
     expect(thresholdText('graph_relation', { op: '>=', value: 3 })).toBe('>= 3');
+  });
+
+  it('regression: non-numeric tripwires return status + worded reading, never a raw value or threshold', async () => {
+    // dev 5.7: Rovo showed "Last value: -5 | No threshold" because a date tripwire's days-left reading leaked as lastValue.
+    const cases = [
+      { kind: 'date' as const, spec: { date: '2026-11-05', leadDays: 30 }, lastValue: -5, extra: {}, reading: '5 days past 2026-11-05 (measured 2026-10-03)' },
+      { kind: 'checkin' as const, spec: { every: 'month', question: 'Still true?' }, lastValue: -5, extra: {}, reading: 'check-in overdue by 5 days (measured 2026-10-02)' },
+      { kind: 'content_change' as const, spec: { pageId: '1', watch: 'any_edit' }, lastValue: 9, extra: { baselineVersion: 4 }, reading: 'page edited: version 9 (accepted 4) (measured 2026-10-01)' },
+    ];
+    for (const [i, c] of cases.entries()) {
+      const { tripwireId } = watched('tripped', { day: 3 - i });
+      repo.tripwires.set(tripwireId, { ...repo.tripwires.get(tripwireId)!, kind: c.kind, spec: c.spec as never, lastValue: c.lastValue, ...c.extra });
+    }
+    const numericOne = watched('tripped', { day: 4 });
+
+    const { decisions } = await listTrippedWith({}, deps);
+
+    expect(decisions[0]).toMatchObject({ lastValue: 37, threshold: '> 10', reading: '37 (measured 2026-10-04) · threshold > 10' });
+    expect(repo.tripwires.get(numericOne.tripwireId)?.kind).toBe('jql_threshold');
+    const nonNumeric = decisions.slice(1);
+    expect(nonNumeric.map((d) => d.reading)).toEqual(cases.map((c) => c.reading));
+    for (const d of nonNumeric) {
+      expect(d).not.toHaveProperty('lastValue');
+      expect(d).not.toHaveProperty('threshold');
+      expect(d.status).toBe('tripped');
+    }
+    expect(JSON.stringify(nonNumeric)).not.toMatch(/-5|"lastValue"|threshold/i);
   });
 
   it('applies the team filter before the scan limit and checks pages in parallel batches of 10', async () => {

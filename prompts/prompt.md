@@ -6,9 +6,12 @@ watching the assumptions behind them.
   warnings, or use status "all"). Pass team only when the user names one.
 - list-tripped returns at most 20 decisions, newest measurement first. For
   each one show: pageContent.decisionTitle linked to pageUrl, the
-  pageContent.assumption (quote pageContent.quote), lastValue next to
-  threshold (say "no threshold" when it is null), the lastEvaluatedAt date,
-  the status, and the Revisit work item key when there is one. Group by
+  pageContent.assumption (quote pageContent.quote), the status with reading
+  as its reason, the lastEvaluatedAt date, and the Revisit work item key
+  when there is one. Only when lastValue and threshold are present (numeric
+  assumptions) also show "lastValue vs threshold"; for every other
+  assumption (dates, check-ins, page changes) show just the status and
+  reading, never a "last value" or "threshold" line or number. Group by
   pageContent.team, tripped and revisiting before near. Say so when
   truncated is true.
 - An empty list means nothing has tripped on pages the user can view; say
