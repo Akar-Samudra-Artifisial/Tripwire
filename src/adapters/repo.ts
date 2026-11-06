@@ -102,6 +102,8 @@ export interface Repo {
   upsertDecision(d: Omit<DecisionRow, 'id'> & { id?: string }): Promise<DecisionRow>;
   markExtractError(pageId: string, error: string): Promise<void>;
   listAssumptions(decisionId: string): Promise<Assumption[]>;
+  /** Replaces every `from` with `to` in the assumption's quote and summary (demo date moves); false when nothing changed. */
+  replaceInAssumption(id: string, from: string, to: string): Promise<boolean>;
   listTripwires(decisionId: string): Promise<TripwireRow[]>;
   hasConfirmedTripwires(decisionId: string): Promise<boolean>;
   replaceProposed(decisionId: string, items: { assumption: Assumption; tripwire: TripwireRow }[]): Promise<void>;
@@ -448,6 +450,20 @@ export const sqlRepo: Repo = {
   async listAssumptions(decisionId) {
     const rows = await query<Row>('SELECT id, decision_id, quote, summary FROM assumptions WHERE decision_id = ? ORDER BY created_at, id', decisionId);
     return rows.map(toAssumption);
+  },
+
+  async replaceInAssumption(id, from, to) {
+    const affected = await execute(
+      'UPDATE assumptions SET quote = REPLACE(quote, ?, ?), summary = REPLACE(summary, ?, ?) WHERE id = ? AND (INSTR(quote, ?) > 0 OR INSTR(summary, ?) > 0)',
+      from,
+      to,
+      from,
+      to,
+      id,
+      from,
+      from,
+    );
+    return affected === 1;
   },
 
   async listTripwires(decisionId) {

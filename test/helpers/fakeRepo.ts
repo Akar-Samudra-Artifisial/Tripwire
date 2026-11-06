@@ -79,6 +79,12 @@ export function fakeRepo(): FakeRepo {
     async listAssumptions(decisionId) {
       return [...repo.assumptions.values()].filter((a) => a.decisionId === decisionId).map(clone);
     },
+    async replaceInAssumption(id, from, to) {
+      const a = repo.assumptions.get(id);
+      if (!a || (!a.quote.includes(from) && !a.summary.includes(from))) return false;
+      repo.assumptions.set(id, { ...a, quote: a.quote.split(from).join(to), summary: a.summary.split(from).join(to) });
+      return true;
+    },
     async listTripwires(decisionId) {
       return [...repo.tripwires.values()].filter((t) => repo.assumptions.get(t.assumptionId)?.decisionId === decisionId).map(clone);
     },
