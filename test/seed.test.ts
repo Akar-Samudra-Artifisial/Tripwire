@@ -10,6 +10,9 @@ const {
   addDays,
   BILLING_JQL,
   BUSY_MESSAGE,
+  CONTENT_EDIT_MESSAGE,
+  DATE_EDIT_MESSAGE,
+  DATE_EDIT_PAGE_MS,
   DEMO,
   DEMO_JQL,
   DEMO_PAGES,
@@ -26,6 +29,7 @@ const {
   TIME_BUDGET_MS,
 } = await import('../src/adapters/seed');
 const { SettingsError } = await import('../src/core/settings');
+const { contentChangeReading } = await import('../src/core/triggers/content_change');
 type SeedDeps = import('../src/adapters/seed').SeedDeps;
 
 const ACCOUNT = '5b10ac8d82e05b22cc7d4ef5';
@@ -112,7 +116,8 @@ function makeDeps(world: World, repo: FakeRepo, evaluate?: SeedDeps['evaluate'])
       byId(id)?.labels.push(label);
     }),
     canEditPage: vi.fn(async (_id: string) => true),
-    updatePage: vi.fn(async (_id: string, _storage: string, _message: string) => 2),
+    updatePage: vi.fn(async (_id: string, _storage: string, _message: string, _readVersion?: number) => 2),
+    getPage: vi.fn(async (id: string, _withBody?: boolean) => ({ id, title: `Page ${id}`, version: 4, spaceId: '65537', body: '<p>Page text</p>' as string | undefined })),
   };
   const deps: SeedDeps = {
     jira,
@@ -457,8 +462,8 @@ describe('simulateBusyMonth', () => {
     // A month passed: the date is yesterday and the watched page got a new version.
     expect((repo.tripwires.get(w.retention.tripwireIds[0]!)?.spec as { date: string }).date).toBe('2026-11-01');
     expect(confluence.updatePage).toHaveBeenCalledTimes(1);
-    expect(confluence.updatePage).toHaveBeenCalledWith('303', expect.stringContaining('Reviewed 2026-11-02'), expect.any(String));
-    expect(confluence.updatePage.mock.calls[0]?.[1]).toContain('Node.js with TypeScript');
+    // The page as read now (not the template) plus the dated review note, as one write on the read version.
+    expect(confluence.updatePage).toHaveBeenCalledWith('303', '<p>Page text</p><p><em>Reviewed 2026-11-02 (demo edit by Tripwire "Simulate a busy month").</em></p>', CONTENT_EDIT_MESSAGE, 4);
   });
 
   it('moves date/checkin a month on and edits the page for content_change before evaluating', async () => {
@@ -469,6 +474,8 @@ describe('simulateBusyMonth', () => {
     repo.tripwires.set('tw-check', { ...base, id: 'tw-check', kind: 'checkin', spec: { every: 'quarter', question: 'Still on PDF?' }, confirmedAt: '2026-11-01T00:00:00.000Z', baselineVersion: null });
     repo.tripwires.set('tw-page', { ...base, id: 'tw-page', kind: 'content_change', spec: { pageId: '1', watch: 'any_edit' }, baselineVersion: 1 });
     const { deps, confluence } = makeDeps({ project: true, tickets: 7 }, repo, tripping(decisionId));
+    // An empty page body: the content_change edit falls back to the demo template.
+    confluence.getPage.mockImplementation(async (id: string) => ({ id, title: 'Defer CSV export', version: 4, spaceId: '65537', body: '' }));
 
     await simulateBusyMonth(deps, ACCOUNT);
 
@@ -478,7 +485,7 @@ describe('simulateBusyMonth', () => {
     expect(repo.tripwires.get('tw-check')?.confirmedAt).toBe(new Date(NOW - 92 * 86_400_000).toISOString());
     const pageId = repo.decisions.get(decisionId)!.pageId;
     expect(confluence.updatePage).toHaveBeenCalledTimes(1);
-    expect(confluence.updatePage).toHaveBeenCalledWith(pageId, expect.stringContaining('Reviewed 2026-11-02'), expect.any(String));
+    expect(confluence.updatePage).toHaveBeenCalledWith(pageId, expect.stringContaining('Reviewed 2026-11-02'), CONTENT_EDIT_MESSAGE, 4);
     expect(confluence.updatePage.mock.calls[0]?.[1]).toContain('Fewer than 10 customer requests for CSV export per month');
   });
 
@@ -894,5 +901,204 @@ describe('background demo job (one click, runs in the demo-seed consumer)', () =
     const { deps } = makeDeps({ project: true, tickets: 7 }, repo);
     const { job } = await oneClick('simulate', deps);
     expect(job).toMatchObject({ status: 'failed', error: 'Run "Load demo data" first.' });
+  });
+});
+
+describe('simulateBusyMonth: date tripwires move in the page text too', () => {
+  const QUOTE = 'The mobile release freeze starts on 2026-11-05; the Mobile leads confirm the freeze window on that date.';
+  const DECISION = '<p><strong>No mobile app release ships between 2026-11-05 and 2026-11-25.</strong></p>';
+  const PAGE = `${DECISION}<h2>Assumptions</h2><ul><li>${QUOTE}</li></ul>`;
+
+  /** Lumora world where page 304 (version 4) quotes the date tripwire's 2026-11-05 and has a content_change baseline on 4. */
+  function datedWorld(body = PAGE) {
+    const w = lumoraWorld(repo);
+    const asm = repo.assumptions.get('asm-event-retention-0')!;
+    repo.assumptions.set(asm.id, { ...asm, quote: QUOTE, summary: 'Freeze starts 2026-11-05' });
+    // A watched-page tripwire on the same decision whose baseline is the read version (tripped: not aged itself).
+    repo.tripwires.set('tw-retention-watch', {
+      id: 'tw-retention-watch',
+      assumptionId: asm.id,
+      kind: 'content_change',
+      spec: { pageId: '304', watch: 'any_edit' },
+      status: 'tripped',
+      confirmedBy: ACCOUNT,
+      confirmedAt: '2026-10-01T00:00:00.000Z',
+      strikes: 0,
+      lastValue: null,
+      lastOutcome: null,
+      lastEvaluatedAt: null,
+      baselineVersion: 4,
+    });
+    const made = makeDeps({ project: true, tickets: 7, billing: 2 }, repo, vi.fn(async () => ({ results: [], rateLimited: false })));
+    const page = { body, version: 4 };
+    made.confluence.getPage.mockImplementation(async (id: string) =>
+      id === '304' ? { id, title: 'Freeze', version: page.version, spaceId: '65537', body: page.body } : { id, title: `Page ${id}`, version: 4, spaceId: '65537', body: '<p>Page text</p>' },
+    );
+    made.confluence.updatePage.mockImplementation(async (id: string, storage: string, _message: string, readVersion?: number) => {
+      if (id !== '304') return 2;
+      if (readVersion !== undefined && readVersion !== page.version) throw new Error(`page is at version ${page.version}`);
+      page.body = storage;
+      page.version += 1;
+      return page.version;
+    });
+    return { w, ...made, page };
+  }
+
+  const decision304 = () => repo.decisions.get('dec-event-retention')!;
+  const dateEdits = (calls: unknown[][]) => calls.filter((c) => c[0] === '304' && c[2] === DATE_EDIT_MESSAGE);
+  const specDate = (w: ReturnType<typeof lumoraWorld>) => (repo.tripwires.get(w.retention.tripwireIds[0]!)?.spec as { date: string }).date;
+
+  it('moves the date only in the assumption sentence and the stored assumption, moving version and baseline', async () => {
+    const { w, deps, confluence, page } = datedWorld();
+
+    await simulateBusyMonth(deps, ACCOUNT);
+
+    expect(specDate(w)).toBe('2026-11-01');
+    expect(dateEdits(confluence.updatePage.mock.calls)).toHaveLength(1);
+    expect(dateEdits(confluence.updatePage.mock.calls)[0]?.[3]).toBe(4);
+    expect(page.body).toContain('<li>The mobile release freeze starts on 2026-11-01;');
+    // The decision sentence keeps its own dates.
+    expect(page.body).toContain(DECISION);
+    expect(repo.assumptions.get('asm-event-retention-0')).toMatchObject({ quote: QUOTE.replace('2026-11-05', '2026-11-01'), summary: 'Freeze starts 2026-11-01' });
+    // Extracted version = saved version: the page event's extraction is skipped as same_version.
+    expect(decision304().pageVersion).toBe(5);
+    const baseline = repo.tripwires.get('tw-retention-watch')!.baselineVersion!;
+    expect(baseline).toBe(5);
+    expect(contentChangeReading(5, baseline).outcome).toBe('safe');
+    expect(repo.pageLocks.get('304')?.extract).toBeUndefined();
+  });
+
+  it('leaves the page alone when the old date is not in the assumption sentence', async () => {
+    const { w, deps, confluence } = datedWorld(`${DECISION}<ul><li>The freeze starts in early November.</li></ul>`);
+
+    const result = await simulateBusyMonth(deps, ACCOUNT);
+
+    expect(result.complete).toBe(true);
+    expect(specDate(w)).toBe('2026-11-01');
+    expect(dateEdits(confluence.updatePage.mock.calls)).toHaveLength(0);
+    expect(decision304().pageVersion).toBe(4);
+    expect(repo.assumptions.get('asm-event-retention-0')?.quote).toBe(QUOTE);
+  });
+
+  it('a failed write does not fail Simulate, puts version and baseline back, and the next click makes it up', async () => {
+    const { w, deps, confluence, page } = datedWorld();
+    const realUpdate = confluence.updatePage.getMockImplementation()!;
+    confluence.updatePage.mockImplementation(async (id: string, ...rest: [string, string, number?]) => {
+      if (id === '304') throw new Error('Confluence update page 304 failed: 500');
+      return realUpdate(id, ...rest);
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const result = await simulateBusyMonth(deps, ACCOUNT);
+
+    expect(result.complete).toBe(true);
+    expect(specDate(w)).toBe('2026-11-01');
+    expect(decision304().pageVersion).toBe(4);
+    expect(repo.tripwires.get('tw-retention-watch')?.baselineVersion).toBe(4);
+    expect(repo.assumptions.get('asm-event-retention-0')?.quote).toBe(QUOTE);
+    expect(repo.pageLocks.get('304')?.extract).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith('tripwire simulateBusyMonth: demo page not edited, the next click tries again', expect.objectContaining({ pageId: '304' }));
+    warn.mockRestore();
+
+    // Next click (the tripwire has tripped meanwhile): the text catches up with the date it already has.
+    confluence.updatePage.mockImplementation(realUpdate);
+    const t = repo.tripwires.get(w.retention.tripwireIds[0]!)!;
+    repo.tripwires.set(t.id, { ...t, status: 'tripped' });
+    await simulateBusyMonth(deps, ACCOUNT);
+    expect(specDate(w)).toBe('2026-11-01');
+    expect(page.body).toContain('starts on 2026-11-01;');
+    expect(decision304().pageVersion).toBe(5);
+  });
+
+  it('does not overwrite a user edit made after the page was read', async () => {
+    const { deps, confluence, page } = datedWorld();
+    const userBody = `${PAGE}<p>User note</p>`;
+    confluence.getPage.mockImplementation(async (id: string) => {
+      if (id !== '304') return { id, title: `Page ${id}`, version: 4, spaceId: '65537', body: '<p>Page text</p>' };
+      const read = { id, title: 'Freeze', version: page.version, spaceId: '65537', body: page.body };
+      // The user saves version 5 right after Tripwire read version 4.
+      Object.assign(page, { version: 5, body: userBody });
+      return read;
+    });
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await simulateBusyMonth(deps, ACCOUNT);
+
+    expect(page.body).toBe(userBody);
+    expect(decision304().pageVersion).toBe(4);
+    expect(repo.tripwires.get('tw-retention-watch')?.baselineVersion).toBe(4);
+    expect(repo.assumptions.get('asm-event-retention-0')?.quote).toBe(QUOTE);
+    vi.mocked(console.warn).mockRestore();
+  });
+
+  it('regression: a page with a date and a content_change tripwire gets one write keeping the moved date', async () => {
+    const { w, deps, confluence, page } = datedWorld(`${PAGE}<p><em>Reviewed 2026-10-30 (demo edit by Tripwire &quot;Simulate a busy month&quot;).</em></p>`);
+    const watch = repo.tripwires.get('tw-retention-watch')!;
+    repo.tripwires.set(watch.id, { ...watch, status: 'active' });
+
+    const result = await simulateBusyMonth(deps, ACCOUNT);
+
+    expect(result.complete).toBe(true);
+    const calls304 = confluence.updatePage.mock.calls.filter((c) => c[0] === '304');
+    expect(calls304).toHaveLength(1);
+    expect(calls304[0]?.[2]).toBe(CONTENT_EDIT_MESSAGE);
+    expect(calls304[0]?.[3]).toBe(4);
+    expect(specDate(w)).toBe('2026-11-01');
+    // Moved date kept (not the template), decision sentence untouched, one review note (the old one replaced).
+    expect(page.body).toContain('<li>The mobile release freeze starts on 2026-11-01;');
+    expect(page.body).toContain(DECISION);
+    expect(page.body.match(/Reviewed \d{4}-\d{2}-\d{2}/g)).toEqual(['Reviewed 2026-11-02']);
+    expect(repo.assumptions.get('asm-event-retention-0')?.quote).toBe(QUOTE.replace('2026-11-05', '2026-11-01'));
+    // The content_change edit must trip: its baseline stays on the read version.
+    expect(repo.tripwires.get(watch.id)?.baselineVersion).toBe(4);
+    expect(contentChangeReading(page.version, 4).outcome).toBe('tripped');
+  });
+
+  it('regression: 409 CONFLICT on a page does not fail Simulate; the other pages are still edited', async () => {
+    const { w, deps, confluence } = datedWorld();
+    const watch = repo.tripwires.get('tw-retention-watch')!;
+    repo.tripwires.set(watch.id, { ...watch, status: 'active' });
+    const realUpdate = confluence.updatePage.getMockImplementation()!;
+    confluence.updatePage.mockImplementation(async (id: string, ...rest: [string, string, number?]) => {
+      if (id === '304') throw new Error('Confluence update page 304 failed: 409 {"errors":[{"status":409,"code":"CONFLICT"}]}');
+      return realUpdate(id, ...rest);
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const result = await simulateBusyMonth(deps, ACCOUNT);
+
+    expect(result).toMatchObject({ complete: true, indexed: true });
+    expect(specDate(w)).toBe('2026-11-01');
+    expect(confluence.updatePage).toHaveBeenCalledWith('303', expect.stringContaining('Reviewed 2026-11-02'), CONTENT_EDIT_MESSAGE, 4);
+    expect(repo.assumptions.get('asm-event-retention-0')?.quote).toBe(QUOTE);
+    expect(warn).toHaveBeenCalledWith('tripwire simulateBusyMonth: demo page not edited, the next click tries again', expect.objectContaining({ pageId: '304' }));
+    expect(repo.appLocks.has(SIMULATE_LOCK)).toBe(false);
+    warn.mockRestore();
+  });
+
+  it('skips the page text when an extraction holds the page or too little time is left', async () => {
+    const held = datedWorld();
+    repo.pageLocks.set('304', { extract: new Date(NOW + 60_000).toISOString() });
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await simulateBusyMonth(held.deps, ACCOUNT);
+    expect(dateEdits(held.confluence.updatePage.mock.calls)).toHaveLength(0);
+    expect(specDate(held.w)).toBe('2026-11-01');
+
+    repo = fakeRepo();
+    const late = datedWorld();
+    late.deps.limits = { budgetMs: DATE_EDIT_PAGE_MS - 1, indexWaitMs: 5000, lockSeconds: 60 };
+    await simulateBusyMonth(late.deps, ACCOUNT);
+    expect(dateEdits(late.confluence.updatePage.mock.calls)).toHaveLength(0);
+    expect(specDate(late.w)).toBe('2026-11-01');
+    vi.mocked(console.warn).mockRestore();
+  });
+
+  it('is idempotent: a second click on the same day does not edit the page again', async () => {
+    const { deps, confluence, page } = datedWorld();
+    await simulateBusyMonth(deps, ACCOUNT);
+    await simulateBusyMonth(deps, ACCOUNT);
+    expect(dateEdits(confluence.updatePage.mock.calls)).toHaveLength(1);
+    expect(page.body).toContain('starts on 2026-11-01;');
+    expect(decision304().pageVersion).toBe(5);
   });
 });

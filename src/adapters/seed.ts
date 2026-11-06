@@ -1,8 +1,11 @@
 import { summarise, type EvalOutcome } from '../core/evaluator';
+import { quoteInText } from '../core/extraction';
+import { storageToText } from '../core/pageText';
+import { rememberedVersion, STAMP_LOCK_SECONDS } from '../core/pageVersion';
 import { normaliseSettings, type Settings } from '../core/settings';
 import { EVALUABLE_STATUSES } from '../core/state';
 import { PERIOD_DAYS } from '../core/triggers/checkin';
-import type { CheckinSpec, DateSpec } from '../core/types';
+import type { Assumption, CheckinSpec, DateSpec } from '../core/types';
 import type { confluence as confluenceAdapter } from './confluence';
 import type { AdfDoc, jira as jiraAdapter } from './jira';
 import type { Repo, TripwireRow } from './repo';
@@ -309,7 +312,7 @@ export interface SeedDeps {
   >;
   confluence: Pick<
     typeof confluenceAdapter,
-    'findSpace' | 'createSpace' | 'findPageByTitle' | 'createPage' | 'getPageLabels' | 'addPageLabel' | 'canEditPage' | 'updatePage'
+    'findSpace' | 'createSpace' | 'findPageByTitle' | 'createPage' | 'getPageLabels' | 'addPageLabel' | 'canEditPage' | 'updatePage' | 'getPage'
   >;
   repo: Pick<
     Repo,
@@ -327,6 +330,9 @@ export interface SeedDeps {
     | 'casTripwire'
     | 'acquirePageLock'
     | 'releasePageLock'
+    | 'setDecisionPageVersion'
+    | 'replaceInAssumption'
+    | 'listAssumptions'
   >;
   enqueueExtraction: (pageId: string, force: boolean, requestedBy?: string) => Promise<string>;
   /** Queues an evaluation of these tripwires (the `evaluate` queue). */
@@ -660,31 +666,184 @@ export interface SimulateResult {
 export const simulatedPageStorage = (day: string, base: string = DEMO_PAGE_STORAGE): string =>
   `${base}<p><em>Reviewed ${day} (demo edit by Tripwire "Simulate a busy month").</em></p>`;
 
+/** Version message of the edit that moves a date tripwire's date in the page text too. */
+export const DATE_EDIT_MESSAGE = 'Demo date moved by Tripwire "Simulate a busy month"';
+
+/** A page's date edit is only started while this long is left of the Simulate budget (lock, read, write, re-read). */
+export const DATE_EDIT_PAGE_MS = 6_000;
+
+const ISO_DAY_IN_TEXT = /(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)/g;
+/** Every `day` (YYYY-MM-DD) in a text, not as part of a longer number. */
+const dayPattern = (day: string): RegExp => new RegExp(String.raw`(?<!\d)${day}(?!\d)`, 'g');
+const containsDay = (text: string, day: string): boolean => dayPattern(day).test(text);
+/** Innermost paragraph-like elements of a storage body (a list item holding a paragraph is one block). */
+const BLOCK = /<(p|li|td|th|h[1-6])\b[^>]*>[\s\S]*?<\/\1>/g;
+
+interface DateMove {
+  assumptionId: string;
+  /** The assumption quote the date is moved in: only the page block holding this quote is edited. */
+  quote: string;
+  from: string;
+  to: string;
+}
+
+/**
+ * The date the text of a date tripwire's assumption still says, when it differs from the tripwire's date `to`:
+ * the previous date of the tripwire when the quote has it, else the quote's only date. Read from the stored quote
+ * (updated only after the page was written), so a page write that failed is made up on the next click.
+ */
+function dateMoveOf(assumption: Assumption, previous: string, to: string): DateMove | undefined {
+  const days = [...new Set(assumption.quote.match(ISO_DAY_IN_TEXT) ?? [])];
+  const from = days.includes(previous) ? previous : days.length === 1 ? days[0] : undefined;
+  return from === undefined || from === to ? undefined : { assumptionId: assumption.id, quote: assumption.quote, from, to };
+}
+
+/** `body` with each move's date replaced only inside the block that holds the move's quote; the moves applied. */
+function moveDatesInBlocks(body: string, moves: readonly DateMove[]): { body: string; applied: DateMove[] } {
+  const applied = new Set<DateMove>();
+  const updated = body.replace(BLOCK, (block) => {
+    const text = storageToText(block, Number.MAX_SAFE_INTEGER);
+    return moves.reduce((acc, m) => {
+      if (!containsDay(acc, m.from) || !quoteInText(m.quote, text)) return acc;
+      applied.add(m);
+      return acc.replace(dayPattern(m.from), m.to);
+    }, block);
+  });
+  return { body: updated, applied: moves.filter((m) => applied.has(m)) };
+}
+
+/** Version message of the edit that trips a content_change tripwire. */
+export const CONTENT_EDIT_MESSAGE = 'Demo edit by Tripwire "Simulate a busy month"';
+/** The review note of an earlier Simulate edit (also as Confluence re-serialises it), removed before a new one is added. */
+const SIMULATED_NOTE = /<p>\s*<em>\s*Reviewed \d{4}-\d{2}-\d{2} \(demo edit by Tripwire (?:"|&quot;|&#34;)Simulate a busy month(?:"|&quot;|&#34;)\)\.\s*<\/em>\s*<\/p>/g;
+
+const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/**
+ * The one Simulate write to a demo page (several writes in a row got 409 CONFLICT: a re-read right after a write may
+ * still return the old version). It moves the dates in the assumption sentences (`moves`, other sentences keep
+ * theirs) and, when `watched`, adds the dated review note that trips the page's content_change tripwires. The body
+ * is the page as read now (an earlier review note removed), never the template, so a moved date is not written
+ * back; `base` is only used when the page body is empty. The `extract` page lock is held as by the "Reviewed by"
+ * stamp. A dates-only edit moves the extracted page version and the content_change baselines to the new version
+ * first (`rememberedVersion`), so it neither re-extracts nor trips content_change. A page edited after it was read
+ * is not overwritten. Never throws: a page that could not be written is logged, and the next click makes the dates
+ * up (they are read from the stored quotes, updated only after a write). Returns whether the review note was written.
+ */
+async function editDemoPage(
+  pageId: string,
+  edit: { moves: readonly DateMove[]; watched: boolean; base: string; day: string },
+  deadline: number,
+  deps: SeedDeps,
+): Promise<boolean> {
+  const { repo } = deps;
+  if (edit.moves.length === 0 && !edit.watched) return false;
+  const lockedAt = deps.now();
+  const heldUntil = new Date(lockedAt + STAMP_LOCK_SECONDS * 1000).toISOString();
+  let locked = false;
+  try {
+    locked = await repo.acquirePageLock(pageId, 'extract', new Date(lockedAt).toISOString(), STAMP_LOCK_SECONDS);
+    let moves = edit.moves;
+    if (moves.length > 0 && !locked) {
+      console.warn('tripwire simulateBusyMonth: page is being extracted, its text keeps the old date until the next click', { pageId });
+      moves = [];
+    }
+    if (moves.length > 0 && deps.now() + DATE_EDIT_PAGE_MS > deadline) {
+      console.warn('tripwire simulateBusyMonth: not enough time left to move the date in the page text, next click does it', { pageId });
+      moves = [];
+    }
+    if (moves.length === 0 && !edit.watched) return false;
+
+    const page = await deps.confluence.getPage(pageId, true);
+    const read = page.body ?? '';
+    const { body: dated, applied } = moveDatesInBlocks(read, moves);
+    if (moves.length > 0 && applied.length === 0) {
+      console.warn('tripwire simulateBusyMonth: old date not in the assumption text, dates left as is', { pageId, dates: moves.map((m) => m.from) });
+    }
+    if (applied.length === 0 && !edit.watched) return false;
+    const body = edit.watched ? simulatedPageStorage(edit.day, read.trim() === '' ? edit.base : dated.replace(SIMULATED_NOTE, '')) : dated;
+
+    // A content_change edit has to trip its tripwires: then nothing is moved.
+    const remembered = edit.watched ? undefined : await rememberedVersion(pageId, page.version, deps);
+    const next = page.version + 1;
+    await remembered?.moveTo(next);
+    let saved: number;
+    try {
+      saved = await deps.confluence.updatePage(pageId, body, edit.watched ? CONTENT_EDIT_MESSAGE : DATE_EDIT_MESSAGE, page.version);
+    } catch (err) {
+      // As the stamp: keep the new version only when the write went through anyway (e.g. a timeout).
+      const again = await deps.confluence.getPage(pageId, true).catch(() => undefined);
+      const text = storageToText(again?.body ?? '', Number.MAX_SAFE_INTEGER);
+      const savedAnyway =
+        again !== undefined &&
+        again.version > page.version &&
+        applied.every((m) => quoteInText(m.quote.split(m.from).join(m.to), text)) &&
+        (!edit.watched || text.includes(`Reviewed ${edit.day}`));
+      if (!savedAnyway) {
+        await remembered?.moveTo(page.version);
+        throw err;
+      }
+      saved = again.version;
+    }
+    // Confluence numbers the version itself; follow it when it differs from the one asked for (as the stamp does).
+    if (saved !== next) await remembered?.moveTo(saved);
+    for (const m of applied) await repo.replaceInAssumption(m.assumptionId, m.from, m.to);
+    return edit.watched;
+  } catch (err) {
+    console.warn('tripwire simulateBusyMonth: demo page not edited, the next click tries again', { pageId, error: errorText(err) });
+    return false;
+  } finally {
+    // An expired lock may belong to an extraction by now: leave it (and only free our own).
+    if (locked && deps.now() < Date.parse(heldUntil)) {
+      await repo.releasePageLock(pageId, 'extract', heldUntil).catch((err: unknown) => {
+        console.warn('tripwire simulateBusyMonth: lock release failed', { pageId, error: errorText(err) });
+      });
+    }
+  }
+}
+
 /**
  * Moves the demo's non-numeric tripwires a month on, so one evaluation trips them: a date tripwire's date becomes
- * yesterday, a check-in's last answer goes one period plus a day back, and a watched page gets a new version.
- * Only `active`/`near` tripwires are touched (by CAS); handled dates stay handled. Returns how many were moved.
+ * yesterday (in its assumption sentence too), a check-in's last answer goes one period plus a day back, and a
+ * watched page gets a new version. Only `active`/`near` tripwires are aged (by CAS); handled dates stay handled.
+ * The page gets at most one write (`editDemoPage`), so a page with a date and a content_change tripwire is not
+ * written twice; a failed write never fails Simulate. Returns how many were moved.
  */
-async function ageDemoTripwires(pageId: string, base: string, tripwires: readonly TripwireRow[], deps: SeedDeps): Promise<number> {
+async function ageDemoTripwires(pageId: string, base: string, tripwires: readonly TripwireRow[], deadline: number, deps: SeedDeps): Promise<number> {
   const { repo } = deps;
   const now = deps.now();
   let aged = 0;
-  let pageEdited = false;
+  let watched = false;
+  // Every date tripwire with the date its text should say (also ones aged by an earlier click, so a failed write is made up).
+  const dated: { t: TripwireRow; previous: string; to: string }[] = [];
   for (const t of tripwires) {
-    if (t.status !== 'active' && t.status !== 'near') continue;
-    if (t.kind === 'date') {
+    if (t.kind === 'date' && !(t.spec as DateSpec).resolved) {
       const spec = t.spec as DateSpec;
-      if (spec.resolved) continue;
-      if (await repo.casTripwire(t.id, [t.status], { spec: { ...spec, date: isoDay(now - DAY_MS) } })) aged += 1;
-    } else if (t.kind === 'checkin') {
+      const date = isoDay(now - DAY_MS);
+      const moved = (t.status === 'active' || t.status === 'near') && (await repo.casTripwire(t.id, [t.status], { spec: { ...spec, date } }));
+      if (moved) aged += 1;
+      dated.push({ t, previous: spec.date, to: moved ? date : spec.date });
+    }
+    if (t.status !== 'active' && t.status !== 'near') continue;
+    if (t.kind === 'checkin') {
       const days = PERIOD_DAYS[(t.spec as CheckinSpec).every] + 1;
       if (await repo.casTripwire(t.id, [t.status], { confirmedAt: new Date(now - days * DAY_MS).toISOString() })) aged += 1;
-    } else if (t.kind === 'content_change' && !pageEdited) {
-      await deps.confluence.updatePage(pageId, simulatedPageStorage(isoDay(now), base), 'Demo edit by Tripwire "Simulate a busy month"');
-      pageEdited = true;
-      aged += 1;
+    } else if (t.kind === 'content_change') {
+      watched = true;
     }
   }
+
+  let moves: DateMove[] = [];
+  if (dated.length > 0) {
+    const decision = await repo.getDecisionByPage(pageId);
+    const assumptions = new Map((decision ? await repo.listAssumptions(decision.id) : []).map((a) => [a.id, a]));
+    moves = dated.flatMap(({ t, previous, to }) => {
+      const assumption = assumptions.get(t.assumptionId);
+      const move = assumption ? dateMoveOf(assumption, previous, to) : undefined;
+      return move ? [move] : [];
+    });
+  }
+  if (await editDemoPage(pageId, { moves, watched, base, day: isoDay(now) }, deadline, deps)) aged += 1;
   return aged;
 }
 
@@ -806,7 +965,7 @@ export async function simulateBusyMonth(deps: SeedDeps, accountId: string): Prom
     if (indexed) {
       await report(deps, 3, SIMULATE_STEPS, 'Moving dates, check-ins and pages a month on');
       const agedPerPage = await Promise.all(
-        pageTripwires.map(({ pageId, tripwires }) => ageDemoTripwires(pageId, demoPageOf(state, pageId)?.storage(isoDay(deps.now())) ?? DEMO_PAGE_STORAGE, tripwires, deps)),
+        pageTripwires.map(({ pageId, tripwires }) => ageDemoTripwires(pageId, demoPageOf(state, pageId)?.storage(isoDay(deps.now())) ?? DEMO_PAGE_STORAGE, tripwires, deadline, deps)),
       );
       const aged = agedPerPage.reduce((sum, n) => sum + n, 0);
       if (aged > 0) console.info('tripwire simulateBusyMonth: non-numeric tripwires moved a month on', { aged });

@@ -1,5 +1,5 @@
-import type { Repo, TripwireRow } from '../adapters/repo';
-import type { ContentChangeSpec, TripwireStatus } from '../core/types';
+import type { Repo } from '../adapters/repo';
+import { rememberedVersion, STAMP_LOCK_SECONDS } from '../core/pageVersion';
 
 /**
  * "Reviewed by <admin>." note added to the demo pages after "Load demo data", as the admin who clicked. The pages
@@ -7,8 +7,6 @@ import type { ContentChangeSpec, TripwireStatus } from '../core/types';
  * graph context a contributor on every demo page. Runs in a resolver: only there can Tripwire act as the user.
  */
 
-/** Held while stamping a page: the `extract` page lock, so no extraction reads or writes the page meanwhile. */
-export const STAMP_LOCK_SECONDS = 120;
 /** Pages stamped at the same time. */
 export const STAMP_CONCURRENCY = 4;
 /** Everything must end within this long (the resolver limit is 25 s; schema and job checks run before). */
@@ -68,44 +66,11 @@ export interface StampResult {
 
 type Outcome = { kind: 'stamped' | 'skipped' | 'failed' | 'pending'; cleared: number };
 
-const ALL_STATUSES: readonly TripwireStatus[] = ['proposed', 'active', 'near', 'tripped', 'revisiting', 'archived'];
-
 const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 async function clearGraphs(pageId: string, deps: DemoStampDeps): Promise<number> {
   const decision = await deps.repo.getDecisionByPage(pageId);
   return decision ? deps.repo.clearRadarGraphCache(decision.id) : 0;
-}
-
-/**
- * What Tripwire remembers about the page version: the extracted version (so the page event's extraction is skipped
- * as `same_version`, no LLM call) and the baseline of content_change tripwires that matched the read version (so the
- * note does not trip them). `moveTo` moves both from where they are now to another version, each by CAS on the value
- * this stamp wrote, so anything changed meanwhile by someone else is left alone.
- */
-async function rememberedVersion(pageId: string, version: number, deps: DemoStampDeps): Promise<{ moveTo: (to: number) => Promise<void> }> {
-  const { repo } = deps;
-  const decision = await repo.getDecisionByPage(pageId);
-  let ownsVersion = decision?.pageVersion === version;
-  const tripwires: TripwireRow[] = decision
-    ? (await repo.listTripwires(decision.id)).filter(
-        (t) => t.kind === 'content_change' && t.baselineVersion === version && (t.spec as ContentChangeSpec).pageId === pageId,
-      )
-    : [];
-  let owned = tripwires.map((t) => t.id);
-  let current = version;
-  return {
-    moveTo: async (to) => {
-      if (to === current) return;
-      if (ownsVersion) ownsVersion = await repo.setDecisionPageVersion(pageId, current, to);
-      const kept: string[] = [];
-      for (const id of owned) {
-        if (await repo.casTripwire(id, ALL_STATUSES, { baselineVersion: to }, { baselineVersion: current })) kept.push(id);
-      }
-      owned = kept;
-      current = to;
-    },
-  };
 }
 
 /** After a failed write: the version the note is on when the write went through anyway (e.g. a timeout), else undefined. */

@@ -182,9 +182,16 @@ export const confluence = {
     return { id: String(page.id), webUrl: links?.base && links.webui ? `${links.base}${links.webui}` : undefined };
   },
 
-  /** Replaces the body of a current page (storage-format XHTML) as a new version; returns that version number. */
-  async updatePage(pageId: string, storage: string, versionMessage: string): Promise<number> {
+  /**
+   * Replaces the body of a current page (storage-format XHTML) as a new version; returns that version number. With
+   * `readVersion` (the version the new body was built from) a page edited since then is not overwritten: this
+   * throws, and Confluence itself rejects the write when an edit lands between the version check and the PUT.
+   */
+  async updatePage(pageId: string, storage: string, versionMessage: string, readVersion?: number): Promise<number> {
     const current = await this.getPage(pageId);
+    if (readVersion !== undefined && current.version !== readVersion) {
+      throw new Error(`Confluence update page ${pageId} skipped: page is at version ${current.version}, the edit was made on ${readVersion}`);
+    }
     const res = await api.asApp().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, {
       method: 'PUT',
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
