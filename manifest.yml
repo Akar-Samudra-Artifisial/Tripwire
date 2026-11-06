@@ -93,8 +93,8 @@ modules:
       function: list-tripped-fn
       actionVerb: GET
       description: List decisions whose assumptions tripped (or are near), newest first,
-        with page link, assumption, last value vs threshold, status, Revisit work item
-        and measurement date. Only pages the user can view.
+        with page link, assumption, status and its reason (value vs threshold only
+        for numeric ones), Revisit item and date. Only pages the user can view.
       inputs:
         team:
           title: Team
