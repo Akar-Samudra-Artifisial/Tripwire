@@ -4,6 +4,10 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 
 ## [Unreleased]
 
+## [3.x] - 2026-11-06
+
+Rilis production untuk submisi Codegeist 2026 (Forge major version 3). Versi persisnya diberi oleh Forge: 3.3.0 dideploy 2026-11-02, lalu perbaikan berikutnya dideploy sebagai pembaruan minor sampai 2026-11-06.
+
 ### Added
 - Kerangka app Forge "Tripwire" (Confluence wajib, Jira opsional). Modul inti dipasang sejak awal agar tidak perlu major upgrade nanti: Forge SQL, Forge LLM (Claude), trigger halaman Confluence, `scheduledTrigger` harian, antrean `extract` dan `evaluate`, byline Confluence, halaman global "Decision Health", panel isu Jira "Decision revisit", halaman admin "Tripwire setup", serta agen Rovo "Decision Steward" dengan action `list-tripped`. Semua tampilan dan action masih berisi data placeholder.
 - Lima jenis pemicu (`jql_threshold`, `graph_relation`, `date`, `content_change`, `checkin`) dengan `validate`/`evaluate` bertipe, model data, dan migrasi awal Forge SQL.
