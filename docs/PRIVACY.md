@@ -18,7 +18,7 @@ Within the site where it is installed, and only as far as the permissions you ap
 
 - **Confluence:** pages, their labels and spaces, to find decision pages and read their content (`read:confluence-content.*`, `read:page:confluence`, `read:label:confluence`, `read:space:confluence`)
 - **Jira:** issues and projects, to evaluate tripwire queries (JQL) and to track Revisit work items (`read:jira-work`)
-- **Teamwork Graph (read-only):** relations between issues, projects, users and pages (`read:graph:*`)
+- **Teamwork Graph (read-only):** relations between issues, projects, users, pages, spaces and teams (`read:graph:*`), including the teams linked to a Confluence space
 
 The Rovo agent "Decision Steward" uses the same data. It lists only decisions on pages the asking user can view.
 
@@ -39,7 +39,7 @@ Data the app persists is kept in Atlassian-hosted Forge SQL, separate for each i
 - evaluation results: the numbers measured (such as issue counts) and the outcome
 - revisits: the Jira issue key, status and outcome
 - settings for the installation
-- contradiction radar: pairs of decisions that may conflict, with a short summary, and Teamwork Graph aggregates for each pair (how many people contributed to each page and to both, and the names of their teams). Contributor account IDs are used only to compute these numbers and are not stored
+- contradiction radar: pairs of decisions that may conflict, with a short summary, and Teamwork Graph context for each pair: the names of the teams linked to each page's space, whether the pages are in the same space, and, when the graph returns them, how many people contributed to each page and to both and the names of their teams. Contributor account IDs and team IDs are used only to compute these values and are not stored
 - Atlassian account IDs: the decision owner, the user who confirmed a tripwire, and the user who resolved a revisit
 
 The app does not store names or email addresses. The developer has no access to your data. The app does not sell or share your data, and does not use it for advertising or model training. It uses no third-party analytics.

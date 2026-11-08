@@ -115,7 +115,12 @@ flowchart LR
 
 ### Teamwork Graph (read-only)
 
-Tripwire only **reads** Teamwork Graph (Preview), for the Radar: `confluencePageContributors` and `atlassianUserInTeams` via `api.asUser().requestTeamworkGraph`. Only aggregate counts are stored; Tripwire writes nothing to the graph. New pages can take a while to be indexed, so Radar team data for freshly created pages may appear later.
+Tripwire only **reads** Teamwork Graph (Preview), for the Radar, via `api.asUser().requestTeamworkGraph` (resolvers only):
+
+- **Space teams (context):** `atlassianTeamsBySpace` returns the teams linked to each page's space. The Radar shows them as "Decision space owned by: <team> (via Teamwork Graph)", or "Decision space: no team linked in Teamwork Graph". They are context only: a shared space does not make two decisions the same team, and space teams never change severity.
+- **Contributors (best effort):** `confluencePageContributors` and `atlassianUserInTeams` add shared-contributor counts and the contributors' teams when the graph returns users. Those teams decide "different teams"; without them the Radar uses the team label on the decision page ("teams from page labels"). When the graph returns edges whose user node is null, the Radar shows "contributors: graph returned no users" and logs the GraphQL error instead of treating it as "no shared contributors".
+
+Only team names and aggregate counts are stored; Tripwire writes nothing to the graph. New pages can take a while to be indexed, so contributor data for freshly created pages may appear later.
 
 ## Screenshots
 
@@ -162,7 +167,7 @@ Tripwire runs entirely on Atlassian Forge. The manifest declares no external fet
 | `write:confluence-content`, `write:page:confluence`, `write:confluence-space` | Create the demo space and pages, and edit only those demo pages (Load, Simulate, Reset); your own pages are never changed |
 | `read:jira-work`, `write:jira-work` | Evaluate JQL thresholds; create, comment on and transition Revisit work items |
 | `manage:jira-project`, `manage:jira-configuration` | Revisit project setup, admin check, issue types for Revisit tasks |
-| `read:graph:issue:jira`, `read:graph:project:jira`, `read:graph:user:atlassian`, `read:graph:page:confluence`, `read:graph:team:atlassian` | Teamwork Graph, read-only (Radar team context) |
+| `read:graph:issue:jira`, `read:graph:project:jira`, `read:graph:user:atlassian`, `read:graph:page:confluence`, `read:graph:team:atlassian`, `read:graph:space:confluence` | Teamwork Graph, read-only (Radar team context: teams linked to spaces, page contributors and their teams) |
 
 Details: [Privacy policy](docs/PRIVACY.md) · [Terms of service](docs/TERMS.md)
 

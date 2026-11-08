@@ -4,7 +4,14 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 
 ## [Unreleased]
 
+### Added
+- Radar mengambil tim yang ditautkan ke space tiap halaman lewat Teamwork Graph `atlassianTeamsBySpace` (query `tripwire_spaceTeams`, sebagai pengguna, satu lookup per space) dan menampilkannya sebagai konteks: "Decision space owned by: <tim> (via Teamwork Graph)", "Decision space: no team linked in Teamwork Graph", atau "Teamwork Graph lookup failed". Pasangan beda space menampilkan konteks kedua space. Tim space tidak memengaruhi severity dan tidak pernah dianggap "tim sama". Scope baru `read:graph:space:confluence` (Forge major version baru).
+- Chip sumber tim untuk severity: "teams via Teamwork Graph contributors" atau "teams from page labels". Urutannya tim kontributor (Teamwork Graph, bila ada data) lalu label tim di halaman.
+- Cache graph Radar yang tersimpan tanpa konteks tim space diambil ulang saat tab dibuka. Selama cache lama diperbarui, chip menampilkan "checking Teamwork Graph…" / "(refreshing…)".
+
 ### Changed
+- Kontributor yang dikembalikan Teamwork Graph sebagai edge dengan node user null kini tampil "contributors: graph returned no users" (status `no_users`), bukan "not indexed yet". Chip status kontributor lain: "graph returned no data", "not indexed yet", "graph request failed".
+- Setiap query Teamwork Graph mencatat log terstruktur `tripwire twg` (op, rawCount, nullNodes, count, errorCount, pesan error GraphQL ≤ 200 karakter) juga saat `data` ada; node null tidak lagi dibuang tanpa jejak. ARI dan account ID di pesan error diganti `<ari>`/`<accountId>` sebelum dicatat.
 - README: ditulis ulang untuk juri dan pengunjung GitHub (tagline, badge, video demo, problem → solution, diagram Mermaid lifecycle dan arsitektur, galeri 5 screenshot di `docs/images/`, tabel scope dan privasi, panduan development). Link install juri tidak berubah.
 
 ## [3.x] - 2026-11-06
