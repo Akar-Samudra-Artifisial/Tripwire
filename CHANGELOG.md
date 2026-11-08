@@ -4,6 +4,9 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 
 ## [Unreleased]
 
+### Changed
+- README: ditulis ulang untuk juri dan pengunjung GitHub (tagline, badge, video demo, problem → solution, diagram Mermaid lifecycle dan arsitektur, galeri 5 screenshot di `docs/images/`, tabel scope dan privasi, panduan development). Link install juri tidak berubah.
+
 ## [3.x] - 2026-11-06
 
 Rilis production untuk submisi Codegeist 2026 (Forge major version 3). Versi persisnya diberi oleh Forge: 3.3.0 dideploy 2026-11-02, lalu perbaikan berikutnya dideploy sebagai pembaruan minor sampai 2026-11-06.
