@@ -390,7 +390,7 @@ describe('Radar resolvers', () => {
   it('radarGraphContext fetches the graph as the user with the site id and caches it', async () => {
     const pairId = await openPair();
     const result = await health('radarGraphContext', { pairId });
-    expect(forge.fetchPairGraph).toHaveBeenCalledWith(expect.any(Function), 'cloud-1', expect.any(String), expect.any(String));
+    expect(forge.fetchPairGraph).toHaveBeenCalledWith(expect.any(Function), 'cloud-1', expect.any(String), expect.any(String), expect.any(Function));
     expect(result).toMatchObject({ pair: { graph: { state: 'unavailable', reason: 'not_indexed' } } });
     expect(repo.radarPairs.get(pairId)?.graph).toEqual({ state: 'unavailable', reason: 'not_indexed' });
   });

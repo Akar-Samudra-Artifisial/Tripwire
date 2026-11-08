@@ -16,9 +16,21 @@ vi.mock('../src/adapters/sql', () => ({ ensureSchema: async () => undefined, que
 const { candidatePairs, decisionHash, normaliseTopic, pairFingerprint, rankSeverity, runRadarScan, sharedTopics, MAX_ATTEMPTS, MAX_CLASSIFY_PER_SCAN } = await import(
   '../src/core/radar'
 );
-const { cloudIdFromInstallContext, fetchPairGraph, pageAri, parseContributors, parseTeams, MAX_CONTRIBUTOR_PAGES, PAGE_CONTRIBUTORS_QUERY, USER_TEAMS_QUERY, userAri } = await import(
-  '../src/adapters/teamworkGraph'
-);
+const {
+  cloudIdFromInstallContext,
+  fetchPairGraph,
+  pageAri,
+  parseContributors,
+  parseSpaceTeams,
+  parseTeams,
+  scrubErrorText,
+  spaceAri,
+  MAX_CONTRIBUTOR_PAGES,
+  PAGE_CONTRIBUTORS_QUERY,
+  SPACE_TEAMS_QUERY,
+  USER_TEAMS_QUERY,
+  userAri,
+} = await import('../src/adapters/teamworkGraph');
 const { buildRadarMessages, neutralise, parseVerdict } = await import('../src/llm/radar');
 const { appKey, parseGraph } = await import('../src/adapters/repo');
 const { radarScanWith, RADAR_LAST_SCAN_KEY, RADAR_LOCK } = await import('../src/surfaces/background');
@@ -123,7 +135,7 @@ describe('candidatePairs', () => {
 
 describe('rankSeverity', () => {
   it('without graph context: confidence × (1 + different teams)', () => {
-    expect(rankSeverity({ confidence: 0.9 }, { a: 'Platform', b: 'Growth' }, null)).toEqual({ score: 1.8, level: 'high', reasons: ['different teams'], graph: false });
+    expect(rankSeverity({ confidence: 0.9 }, { a: 'Platform', b: 'Growth' }, null)).toEqual({ score: 1.8, level: 'high', reasons: ['different teams'], graph: false, teamSource: 'labels' });
     expect(rankSeverity({ confidence: 0.9 }, { a: 'Platform', b: 'platform' }, null)).toMatchObject({ score: 0.9, level: 'medium', reasons: [] });
     expect(rankSeverity({ confidence: 0.6 }, {}, null)).toMatchObject({ score: 0.6, level: 'low', reasons: [] });
   });
@@ -134,6 +146,7 @@ describe('rankSeverity', () => {
       level: 'high',
       reasons: ['different teams', 'no shared contributors'],
       graph: true,
+      teamSource: 'contributor_teams',
     });
     expect(rankSeverity({ confidence: 0.8 }, { a: 'X', b: 'Y' }, okGraph(2, ['Platform'], ['Platform'], true))).toMatchObject({ score: 0.8, reasons: [], graph: true });
   });
@@ -147,6 +160,32 @@ describe('rankSeverity', () => {
 
   it('unavailable graph context is not evidence of zero shared contributors', () => {
     expect(rankSeverity({ confidence: 0.8 }, {}, { state: 'unavailable', reason: 'not_indexed' })).toMatchObject({ score: 0.8, reasons: [], graph: false });
+  });
+
+  const spaces = (teamsA: string[] | null, teamsB: string[] | null, sameSpace = false) => ({ teamsA, teamsB, sameSpace });
+  const noUsers = (s: ReturnType<typeof spaces>): PairGraph => ({ state: 'unavailable', reason: 'no_users', spaces: s });
+
+  it('the same space never means the same team: page labels still decide (regression: DEC pairs lost "different teams")', () => {
+    expect(rankSeverity({ confidence: 0.8 }, { a: 'Platform', b: 'Growth' }, noUsers(spaces([], [], true)))).toEqual({
+      score: 1.6,
+      level: 'high',
+      reasons: ['different teams'],
+      graph: false,
+      teamSource: 'labels',
+    });
+    expect(rankSeverity({ confidence: 0.8 }, { a: 'Platform', b: 'Growth' }, noUsers(spaces(['Decision Council'], ['Decision Council'], true)))).toMatchObject({
+      reasons: ['different teams'],
+      teamSource: 'labels',
+    });
+  });
+
+  it('space teams are context only: different or shared space teams change nothing; contributor teams come first', () => {
+    expect(rankSeverity({ confidence: 0.8 }, { a: 'Same', b: 'Same' }, noUsers(spaces(['Platform Team'], ['Payments Team'])))).toMatchObject({ reasons: [], teamSource: 'labels', graph: false });
+    expect(rankSeverity({ confidence: 0.8 }, {}, noUsers(spaces(null, ['Payments Team'])))).toEqual({ score: 0.8, level: 'medium', reasons: [], graph: false });
+    expect(rankSeverity({ confidence: 0.8 }, { a: 'X', b: 'X' }, { ...okGraph(1, ['A'], ['B'], false), spaces: spaces(['T'], ['T'], true) })).toMatchObject({
+      reasons: ['different teams'],
+      teamSource: 'contributor_teams',
+    });
   });
 });
 
@@ -312,25 +351,44 @@ describe('LLM classifier', () => {
 describe('Teamwork Graph parsing', () => {
   const contributors = (edges: unknown) => ({ data: { confluencePageContributors: { edges, pageInfo: { hasNextPage: false } } } });
 
-  it('reads contributor account ids from data', () => {
+  const meta = (rawCount: number, nullNodes = 0, errors: string[] = []) => ({ rawCount, nullNodes, errorCount: errors.length, errors });
+
+  it('reads contributor account ids from data and counts null user nodes', () => {
     const raw = contributors([{ node: { __typename: 'AtlassianUser', accountId: 'u1', id: 'ari:cloud:identity::user/u1' } }, { node: { id: 'ari:cloud:identity::user/u2' } }, { node: null }]);
-    expect(parseContributors(raw)).toEqual({ ok: true, value: { ids: ['u1', 'u2'] } });
+    expect(parseContributors(raw)).toEqual({ ok: true, value: { ids: ['u1', 'u2'] }, meta: meta(3, 1) });
     const more = { data: { confluencePageContributors: { edges: [], pageInfo: { hasNextPage: true, endCursor: 'c1' } } } };
-    expect(parseContributors(more)).toEqual({ ok: true, value: { ids: [], next: 'c1' } });
+    expect(parseContributors(more)).toEqual({ ok: true, value: { ids: [], next: 'c1' }, meta: meta(0) });
+  });
+
+  it('keeps GraphQL errors next to data (null user nodes are reported, not dropped silently)', () => {
+    const message = `Cannot return null for non-nullable field ${'x'.repeat(300)}`;
+    const raw = { ...contributors([{ node: null }, { node: null }]), errors: [{ message }] };
+    const read = parseContributors(raw);
+    expect(read).toMatchObject({ ok: true, value: { ids: [] }, meta: { rawCount: 2, nullNodes: 2, errorCount: 1 } });
+    expect(read.meta.errors[0]).toHaveLength(200);
   });
 
   it('data null is no_data, not "no contributors"', () => {
-    expect(parseContributors({ data: null, errors: [{ message: 'missing scope' }] })).toEqual({ ok: false, reason: 'no_data', errors: 1, message: 'missing scope' });
+    expect(parseContributors({ data: null, errors: [{ message: 'missing scope' }] })).toEqual({ ok: false, reason: 'no_data', meta: meta(0, 0, ['missing scope']) });
     expect(parseContributors({ data: { confluencePageContributors: null } })).toMatchObject({ ok: false, reason: 'no_data' });
   });
 
   it('empty edges are an empty list', () => {
-    expect(parseContributors(contributors([]))).toEqual({ ok: true, value: { ids: [] } });
+    expect(parseContributors(contributors([]))).toEqual({ ok: true, value: { ids: [] }, meta: meta(0) });
   });
 
   it('reads teams', () => {
     const raw = { data: { atlassianUserInTeams: { edges: [{ node: { id: 'team-1', displayName: 'Platform' } }, { node: { id: '' } }] } } };
-    expect(parseTeams(raw)).toEqual({ ok: true, value: [{ id: 'team-1', name: 'Platform' }] });
+    expect(parseTeams(raw)).toEqual({ ok: true, value: [{ id: 'team-1', name: 'Platform' }], meta: meta(2) });
+  });
+
+  it('reads space teams; an unlinked space is an empty list, data null is no_data', () => {
+    const raw = { data: { atlassianTeamsBySpace: { edges: [{ node: { __typename: 'AtlassianTeam', id: 'ari:team/1', displayName: 'Platform Team' } }, { node: null }] } } };
+    expect(parseSpaceTeams(raw)).toEqual({ ok: true, value: [{ id: 'ari:team/1', name: 'Platform Team' }], meta: meta(2, 1) });
+    expect(parseSpaceTeams({ data: { atlassianTeamsBySpace: { edges: [] } } })).toEqual({ ok: true, value: [], meta: meta(0) });
+    expect(parseSpaceTeams({ data: null, errors: [{ message: 'scope' }] })).toMatchObject({ ok: false, reason: 'no_data' });
+    expect(SPACE_TEAMS_QUERY).toContain('query tripwire_spaceTeams($spaceAri: ID!)');
+    expect(spaceAri('c-1', '5341187')).toBe('ari:cloud:confluence:c-1:space/5341187');
   });
 
   it('builds ARIs, operation names and the cloud id', () => {
@@ -424,6 +482,67 @@ describe('Teamwork Graph parsing', () => {
     expect(await fetchPairGraph(async () => contributors([]), 'c', '1', '2')).toEqual({ state: 'unavailable', reason: 'not_indexed' });
     expect(await fetchPairGraph(async () => Promise.reject(new Error('HTTP 500')), 'c', '1', '2')).toEqual({ state: 'unavailable', reason: 'error' });
   });
+
+  const nullUsers = { ...contributors([{ node: null }]), errors: [{ message: "The field at path 'https://gh.072103.xyz/confluencePageContributors/edges[0]/node' was declared as a non null type" }] };
+  const spaceTeams = (teams: { id: string; displayName: string }[]) => ({ data: { atlassianTeamsBySpace: { edges: teams.map((node) => ({ node })) } } });
+  const platform = { id: 'team-p', displayName: 'Platform Team' };
+  const payments = { id: 'team-q', displayName: 'Payments Team' };
+  const twg = (bySpace: Record<string, { id: string; displayName: string }[]>) =>
+    vi.fn(async (_q: string, vars: Record<string, unknown>, op: string) => {
+      if (op === 'tripwire_spaceTeams') return spaceTeams(bySpace[String(vars.spaceAri)] ?? []);
+      return nullUsers;
+    });
+  const spaceOf = (map: Record<string, string>) => async (pageId: string) => map[pageId];
+
+  it('fetchPairGraph: edges with null user nodes are no_users (not "not indexed") and are logged with the GraphQL error', async () => {
+    const info = vi.mocked(console.info);
+    expect(await fetchPairGraph(async () => nullUsers, 'c', '1', '2')).toEqual({ state: 'unavailable', reason: 'no_users' });
+    expect(info).toHaveBeenCalledWith(
+      'tripwire twg',
+      expect.objectContaining({ op: 'tripwire_pageContributors', pageId: '1', data: true, rawCount: 1, nullNodes: 1, count: 0, errorCount: 1, errors: [expect.stringContaining('non null type')] }),
+    );
+  });
+
+  it('fetchPairGraph: space teams of both pages as context, one lookup per space', async () => {
+    const request = twg({ [spaceAri('c', 's1')]: [platform], [spaceAri('c', 's2')]: [payments] });
+    const graph = await fetchPairGraph(request, 'c', '1', '2', spaceOf({ '1': 's1', '2': 's2' }));
+    expect(graph).toEqual({ state: 'unavailable', reason: 'no_users', spaces: { teamsA: ['Platform Team'], teamsB: ['Payments Team'], sameSpace: false } });
+    expect(rankSeverity({ confidence: 0.9 }, {}, graph)).toEqual({ score: 0.9, level: 'medium', reasons: [], graph: false });
+    expect(request.mock.calls.filter(([, , op]) => op === 'tripwire_spaceTeams')).toHaveLength(2);
+    expect(JSON.stringify(graph)).not.toMatch(/team-p|team-q/);
+    expect(vi.mocked(console.info)).toHaveBeenCalledWith('tripwire twg', expect.objectContaining({ op: 'tripwire_spaceTeams', spaceId: 's1', data: true, rawCount: 1, nullNodes: 0, count: 1, errors: [] }));
+  });
+
+  it('fetchPairGraph: the same space is looked up once and marked sameSpace (no team verdict)', async () => {
+    const same = twg({ [spaceAri('c', 's1')]: [{ id: 'team-d', displayName: 'Decision Council' }] });
+    const graph = await fetchPairGraph(same, 'c', '1', '2', spaceOf({ '1': 's1', '2': 's1' }));
+    expect(graph).toEqual({ state: 'unavailable', reason: 'no_users', spaces: { teamsA: ['Decision Council'], teamsB: ['Decision Council'], sameSpace: true } });
+    expect(same.mock.calls.filter(([, , op]) => op === 'tripwire_spaceTeams')).toHaveLength(1);
+    expect(rankSeverity({ confidence: 0.9 }, { a: 'Platform', b: 'Growth' }, graph)).toMatchObject({ reasons: ['different teams'], teamSource: 'labels' });
+  });
+
+  it('fetchPairGraph: an unlinked space is [] and a failed lookup or unknown space is null', async () => {
+    const unlinked = await fetchPairGraph(twg({ [spaceAri('c', 's1')]: [platform] }), 'c', '1', '2', spaceOf({ '1': 's1', '2': 's2' }));
+    expect(unlinked).toMatchObject({ spaces: { teamsA: ['Platform Team'], teamsB: [] } });
+    const failing = vi.fn(async (_q: string, _v: Record<string, unknown>, op: string) => {
+      if (op === 'tripwire_spaceTeams') throw new Error('HTTP 500');
+      return nullUsers;
+    });
+    const unknownSpace = async (pageId: string) => (pageId === '1' ? Promise.reject(new Error('404')) : 's2');
+    expect(await fetchPairGraph(failing, 'c', '1', '2', unknownSpace)).toMatchObject({ spaces: { teamsA: null, teamsB: null } });
+  });
+
+  it('scrubs ARIs and account ids from GraphQL error text before logging', async () => {
+    const leaky = {
+      ...contributors([{ node: null }]),
+      errors: [{ message: "user 'ari:cloud:identity::user/712020:0a1b2c3d-1111-2222-3333-444455556666' and 5b10ac8d82e05b22cc7d4ef5 failed" }],
+    };
+    await fetchPairGraph(async () => leaky, 'c', '1', '2');
+    const logged = JSON.stringify(vi.mocked(console.info).mock.calls);
+    expect(logged).toContain("user '<ari>' and <accountId> failed");
+    expect(logged).not.toMatch(/712020|5b10ac8d|identity::user/);
+    expect(scrubErrorText('x'.repeat(300))).toHaveLength(200);
+  });
 });
 
 describe('Radar view', () => {
@@ -476,6 +595,17 @@ describe('Radar view', () => {
     expect(fetchGraph).toHaveBeenCalledTimes(2);
     expect(item.graph).toMatchObject({ state: 'ok', sharedContributors: 0, teamsA: ['Platform'] });
     expect(item.severity.reasons).toContain('no shared contributors');
+  });
+
+  it('graph context cached without space teams is refetched; with space teams it is fresh and shown as context', async () => {
+    const id = pairId('ab');
+    const fresh = '2026-11-02T08:59:30.000Z';
+    repo.radarPairs.set(id, { ...repo.radarPairs.get(id)!, graph: { state: 'unavailable', reason: 'not_indexed' }, graphFetchedAt: fresh });
+    expect((await radarListWith(deps, false, RADAR_LAST_SCAN_KEY)).pairs[0]).toMatchObject({ graphStale: true });
+    const spaces = { teamsA: [], teamsB: [], sameSpace: true };
+    repo.radarPairs.set(id, { ...repo.radarPairs.get(id)!, graph: { state: 'unavailable', reason: 'no_users', spaces }, graphFetchedAt: fresh });
+    const [item] = (await radarListWith(deps, false, RADAR_LAST_SCAN_KEY)).pairs;
+    expect(item).toMatchObject({ graphStale: false, graph: { state: 'unavailable', reason: 'no_users', spaces }, severity: { reasons: ['different teams'], teamSource: 'labels' } });
   });
 
   it('graph context: partial/unavailable never replaces a fresh ok cache', async () => {

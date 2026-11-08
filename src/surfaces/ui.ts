@@ -302,7 +302,9 @@ resolver.define('radarGraphContext', ({ payload, context }) =>
     const pairId = (payload as { pairId?: unknown } | undefined)?.pairId;
     if (typeof pairId !== 'string' || pairId === '') return { error: 'pairId is required.' };
     const cloudId = siteIdOf(ctx);
-    const fetchGraph = cloudId ? (a: string, b: string) => fetchPairGraph(asUserGraph(cloudId), cloudId, a, b) : undefined;
+    // Space ids are read as the app: `radarGraphContextWith` only fetches after the user passed the view check of both pages.
+    const spaceOf = async (pageId: string) => (await confluence.getPage(pageId)).spaceId || undefined;
+    const fetchGraph = cloudId ? (a: string, b: string) => fetchPairGraph(asUserGraph(cloudId), cloudId, a, b, spaceOf) : undefined;
     return { pair: await radarGraphContextWith(pairId, radarViewDeps(), fetchGraph) };
   }),
 );

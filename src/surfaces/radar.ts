@@ -1,6 +1,6 @@
 /** Decision Health → Radar tab: open contradiction pairs the user may see, ranked with Teamwork Graph context. */
 import type { Repo } from '../adapters/repo';
-import { rankSeverity, type PairGraph, type PartialReason, type RadarDecisionSummary, type RadarPairView, type Severity } from '../core/radar';
+import { rankSeverity, type PairGraph, type PartialReason, type RadarDecisionSummary, type RadarPairView, type Severity, type SpaceTeams } from '../core/radar';
 import type { TripwireStatus } from '../core/types';
 
 /** Graph context older than this is fetched again when the Radar is opened. */
@@ -26,8 +26,10 @@ export type GraphView =
       teamsA: string[];
       teamsB: string[];
       partial?: PartialReason[];
+      spaces?: SpaceTeams;
     }
-  | { state: 'unavailable'; reason: 'no_data' | 'not_indexed' | 'error' | 'no_site' }
+  | { state: 'unavailable'; reason: 'no_data' | 'not_indexed' | 'no_users' | 'error'; spaces?: SpaceTeams }
+  | { state: 'unavailable'; reason: 'no_site' }
   | { state: 'pending' };
 
 export interface RadarSide {
@@ -76,6 +78,8 @@ export class RadarNotFoundError extends Error {}
 /** Whether the cached graph should be fetched again. */
 export function graphStale(graph: PairGraph | null, fetchedAt: string | null, now: Date): boolean {
   if (!graph || !fetchedAt) return true;
+  // Cached before space teams were read (no `spaces`): fetch again so the Radar never shows a context it did not check.
+  if (!graph.spaces) return true;
   const age = now.getTime() - Date.parse(fetchedAt);
   if (!Number.isFinite(age)) return true;
   return age > (graph.state === 'ok' ? GRAPH_TTL_MS : GRAPH_UNAVAILABLE_TTL_MS);
@@ -84,7 +88,8 @@ export function graphStale(graph: PairGraph | null, fetchedAt: string | null, no
 /** Counts and team names only (the cache never holds contributor account ids). */
 export function toGraphView(graph: PairGraph | null): GraphView {
   if (!graph) return { state: 'pending' };
-  if (graph.state === 'unavailable') return { state: 'unavailable', reason: graph.reason };
+  const spaces = graph.spaces ? { spaces: graph.spaces } : {};
+  if (graph.state === 'unavailable') return { state: 'unavailable', reason: graph.reason, ...spaces };
   return {
     state: graph.state,
     sharedContributors: graph.sharedContributors,
@@ -93,6 +98,7 @@ export function toGraphView(graph: PairGraph | null): GraphView {
     teamsA: graph.teamsA,
     teamsB: graph.teamsB,
     ...(graph.partial ? { partial: graph.partial } : {}),
+    ...spaces,
   };
 }
 
@@ -213,6 +219,8 @@ export async function radarGraphContextWith(
     state: graph.state,
     written,
     ...(graph.state === 'unavailable' ? { reason: graph.reason } : { shared: graph.sharedContributors, partial: graph.partial }),
+    // Same fields the Radar shows: space team counts (null = lookup failed) are context, not a team verdict.
+    ...(graph.spaces ? { spaceTeamsA: graph.spaces.teamsA?.length ?? null, spaceTeamsB: graph.spaces.teamsB?.length ?? null, sameSpace: graph.spaces.sameSpace } : {}),
   });
   if (!written) {
     const current = (await deps.repo.getRadarPair(pairId)) ?? view;

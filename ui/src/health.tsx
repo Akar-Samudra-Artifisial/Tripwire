@@ -3,6 +3,14 @@ import { call } from './bridge';
 import { mount } from './mount';
 import { ErrorText, Shell, StatusBadge } from './components';
 
+interface SpaceTeams {
+  teamsA: string[] | null;
+  teamsB: string[] | null;
+  sameSpace: boolean;
+}
+
+type TeamSource = 'contributor_teams' | 'labels';
+
 type GraphView =
   | {
       state: 'ok' | 'partial';
@@ -12,8 +20,10 @@ type GraphView =
       teamsA: string[];
       teamsB: string[];
       partial?: ('contributors_truncated' | 'teams_failed')[];
+      spaces?: SpaceTeams;
     }
-  | { state: 'unavailable'; reason: 'no_data' | 'not_indexed' | 'error' | 'no_site' }
+  | { state: 'unavailable'; reason: 'no_data' | 'not_indexed' | 'no_users' | 'error'; spaces?: SpaceTeams }
+  | { state: 'unavailable'; reason: 'no_site' }
   | { state: 'pending' };
 
 interface RadarSide {
@@ -30,7 +40,7 @@ interface RadarItem {
   sharedTopics: string[];
   summary: string;
   confidence: number;
-  severity: { score: number; level: 'high' | 'medium' | 'low'; reasons: string[]; graph: boolean };
+  severity: { score: number; level: 'high' | 'medium' | 'low'; reasons: string[]; graph: boolean; teamSource?: TeamSource };
   graph: GraphView;
   graphStale: boolean;
   detectedAt: string;
@@ -48,16 +58,54 @@ const STATES = ['active', 'near', 'tripped', 'revisiting', 'proposed', 'archived
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-const UNAVAILABLE: Record<string, string> = {
-  no_data: 'graph context unavailable',
-  not_indexed: 'graph context unavailable / not indexed yet',
-  error: 'graph context unavailable',
-  no_site: 'graph context unavailable',
+/** Contributor status when the graph gave no usable contributors (an edge with a null user is not "not indexed"). */
+const CONTRIBUTORS_UNAVAILABLE: Record<string, string> = {
+  no_data: 'contributors: graph returned no data',
+  not_indexed: 'contributors: not indexed yet',
+  no_users: 'contributors: graph returned no users',
+  error: 'contributors: graph request failed',
+  no_site: 'graph context unavailable (site unknown)',
 };
 
-function GraphChip({ graph }: { graph: GraphView }) {
+const spacesOf = (graph: GraphView): SpaceTeams | undefined => (graph.state === 'ok' || graph.state === 'partial' || (graph.state === 'unavailable' && graph.reason !== 'no_site') ? graph.spaces : undefined);
+
+/** One side's space context: owned by a team, no team linked, or the lookup failed (null). */
+function spaceText(teams: string[] | null, side: string): string {
+  const label = side ? `Decision space ${side}` : 'Decision space';
+  if (teams === null) return `${label}: Teamwork Graph lookup failed`;
+  if (teams.length === 0) return `${label}: no team linked in Teamwork Graph`;
+  return `${label} owned by: ${teams.join(', ')} (via Teamwork Graph)`;
+}
+
+/**
+ * Who owns the decision space(s), as context only (it never decides "same team"). One chip when both pages share
+ * a space or have the same context, otherwise one per page. While an old cache is being refreshed: "checking".
+ */
+function SpaceChips({ graph, stale }: { graph: GraphView; stale: boolean }) {
+  if (graph.state === 'pending') return null;
+  const spaces = spacesOf(graph);
+  if (!spaces) return stale ? <span className="chip muted">Decision space: checking Teamwork Graph…</span> : null;
+  const a = spaceText(spaces.teamsA, '');
+  if (spaces.sameSpace || a === spaceText(spaces.teamsB, '')) return <span className={spaces.teamsA?.length ? 'chip' : 'chip muted'}>{a}</span>;
+  return (
+    <>
+      <span className={spaces.teamsA?.length ? 'chip' : 'chip muted'}>{spaceText(spaces.teamsA, 'A')}</span>
+      <span className={spaces.teamsB?.length ? 'chip' : 'chip muted'}>{spaceText(spaces.teamsB, 'B')}</span>
+    </>
+  );
+}
+
+/** Which signal compared the teams for severity: the contributors' Teamwork Graph teams or the page labels. */
+function TeamChip({ source }: { source?: TeamSource }) {
+  if (source === 'contributor_teams') return <span className="chip">teams via Teamwork Graph contributors</span>;
+  if (source === 'labels') return <span className="chip muted">teams from page labels</span>;
+  return null;
+}
+
+function GraphChip({ graph, stale }: { graph: GraphView; stale: boolean }) {
   if (graph.state === 'pending') return <span className="chip muted">Loading graph context…</span>;
-  if (graph.state === 'unavailable') return <span className="chip muted">{UNAVAILABLE[graph.reason] ?? 'graph context unavailable'}</span>;
+  // A stale cache stays on screen while it is fetched again; say so instead of presenting it as current.
+  if (graph.state === 'unavailable') return <span className="chip muted">{CONTRIBUTORS_UNAVAILABLE[graph.reason] ?? 'contributors: graph context unavailable'}{stale ? ' (refreshing…)' : ''}</span>;
   if (graph.state === 'partial') {
     const truncated = graph.partial?.includes('contributors_truncated');
     return <span className="chip muted">{truncated ? `shared contributors: ${graph.sharedContributors}+ (partial graph context)` : `shared contributors: ${graph.sharedContributors} (partial graph context)`}</span>;
@@ -115,7 +163,9 @@ function PairCard({ pair, canManage, onDismiss }: { pair: RadarItem; canManage: 
       {pair.summary && <p className="radar__summary">{pair.summary}</p>}
       {pair.sharedTopics.length > 0 && <p className="muted">Shared topics: {pair.sharedTopics.join(', ')}</p>}
       <p className="radar__chips">
-        <GraphChip graph={pair.graph} />
+        <SpaceChips graph={pair.graph} stale={pair.graphStale} />
+        <TeamChip source={pair.severity.teamSource} />
+        <GraphChip graph={pair.graph} stale={pair.graphStale} />
         {pair.severity.reasons.map((r) => (
           <span key={r} className="chip">
             {r}

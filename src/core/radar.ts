@@ -10,10 +10,22 @@ import type { DecisionRow, Repo } from '../adapters/repo';
 export type RadarStatus = 'open' | 'dismissed' | 'resolved' | 'pending';
 
 /**
+ * Teams linked to the spaces of the two pages (Teamwork Graph `atlassianTeamsBySpace`), names only. Context for the
+ * Radar ("decision space owned by"); never a severity signal.
+ */
+export interface SpaceTeams {
+  /** null: unknown (space id unknown, no data or the lookup failed); []: no team linked to the space. */
+  teamsA: string[] | null;
+  teamsB: string[] | null;
+  sameSpace: boolean;
+}
+
+/**
  * Cached Teamwork Graph context of a pair: aggregates only (no account ids), so the cache can be shown to any
- * user who may view both pages. `unavailable` never means "no shared contributors": the graph had no data
- * (missing scope/header), the page is not indexed yet (no contributors), or the call failed. `partial`: the
- * contributor list was cut off after the page limit, or a team lookup failed.
+ * user who may view both pages. `spaces` holds the teams linked to the pages' spaces. `state` describes the
+ * contributor read: `unavailable` never means "no shared contributors": the graph had no data (missing
+ * scope/header), returned edges without users (`no_users`), the page is not indexed yet (no contributors), or the
+ * call failed. `partial`: the contributor list was cut off after the page limit, or a team lookup failed.
  */
 export type PairGraph =
   | {
@@ -26,8 +38,9 @@ export type PairGraph =
       /** Whether the contributors' teams overlap; null when unknown. */
       sharedTeam: boolean | null;
       partial?: PartialReason[];
+      spaces?: SpaceTeams;
     }
-  | { state: 'unavailable'; reason: 'no_data' | 'not_indexed' | 'error' };
+  | { state: 'unavailable'; reason: 'no_data' | 'not_indexed' | 'no_users' | 'error'; spaces?: SpaceTeams };
 
 export type PartialReason = 'contributors_truncated' | 'teams_failed';
 
@@ -192,18 +205,28 @@ export interface Severity {
   reasons: string[];
   /** Whether Teamwork Graph context was used. */
   graph: boolean;
+  /** Where the team comparison came from; absent when the teams are unknown. */
+  teamSource?: TeamSource;
 }
+
+/** `contributor_teams`: Teamwork Graph teams of the pages' contributors; `labels`: team labels on the decision pages. */
+export type TeamSource = 'contributor_teams' | 'labels';
 
 const sameTeamName = (x: string, y: string): boolean => normaliseTopic(x) === normaliseTopic(y);
 
 /**
- * Whether the two decisions come from different teams: from Teamwork Graph teams when both pages have some
- * (no team in common), otherwise from the team names on the decisions. Undefined when unknown.
+ * Whether the two decisions come from different teams, and from which signal: the contributors' Teamwork Graph
+ * teams when known, otherwise the team labels on the decisions. Undefined when unknown. Space teams are context
+ * only (a shared space does not mean a shared team).
  */
-export function crossTeam(teamA: string | undefined, teamB: string | undefined, graph: PairGraph | null): boolean | undefined {
-  if (graph && graph.state !== 'unavailable' && graph.sharedTeam !== null) return !graph.sharedTeam;
-  if (teamA && teamB) return !sameTeamName(teamA, teamB);
+export function teamSignal(teamA: string | undefined, teamB: string | undefined, graph: PairGraph | null): { crossTeam: boolean; source: TeamSource } | undefined {
+  if (graph && graph.state !== 'unavailable' && graph.sharedTeam !== null) return { crossTeam: !graph.sharedTeam, source: 'contributor_teams' };
+  if (teamA && teamB) return { crossTeam: !sameTeamName(teamA, teamB), source: 'labels' };
   return undefined;
+}
+
+export function crossTeam(teamA: string | undefined, teamB: string | undefined, graph: PairGraph | null): boolean | undefined {
+  return teamSignal(teamA, teamB, graph)?.crossTeam;
 }
 
 /**
@@ -218,7 +241,8 @@ export function rankSeverity(
 ): Severity {
   const reasons: string[] = [];
   let weight = 1;
-  if (crossTeam(teams.a, teams.b, graph) === true) {
+  const signal = teamSignal(teams.a, teams.b, graph);
+  if (signal?.crossTeam === true) {
     weight += 1;
     reasons.push('different teams');
   }
@@ -229,7 +253,7 @@ export function rankSeverity(
   const confidence = Math.min(1, Math.max(0, Number.isFinite(pair.confidence) ? pair.confidence : 0));
   const score = Math.round(confidence * weight * 100) / 100;
   const level: SeverityLevel = score >= 1.5 ? 'high' : score >= 0.8 ? 'medium' : 'low';
-  return { score, level, reasons, graph: !!graph && graph.state !== 'unavailable' };
+  return { score, level, reasons, graph: !!graph && graph.state !== 'unavailable', ...(signal ? { teamSource: signal.source } : {}) };
 }
 
 // --- Scan --------------------------------------------------------------------------------------------------------

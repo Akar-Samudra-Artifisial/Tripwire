@@ -176,4 +176,5 @@ permissions:
     - read:graph:project:jira
     - read:graph:user:atlassian
     - read:graph:page:confluence
-    - read:graph:team:atlassian   # Radar: teams of page contributors (cross-team severity)
+    - read:graph:team:atlassian   # Radar: teams of page contributors and of spaces (cross-team severity)
+    - read:graph:space:confluence # Radar: teams linked to a space (atlassianTeamsBySpace)
